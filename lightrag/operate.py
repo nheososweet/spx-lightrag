@@ -3402,13 +3402,15 @@ async def _get_vector_context(
         valid_chunks = []
         for result in results:
             if "content" in result:
-                chunk_with_metadata = {
-                    "content": result["content"],
-                    "created_at": result.get("created_at", None),
-                    "file_path": result.get("file_path", "unknown_source"),
-                    "source_type": "vector",  # Mark the source type
-                    "chunk_id": result.get("id"),  # Add chunk_id for deduplication
-                }
+                # Preserve all fields from Milvus result (including Dynamic Fields)
+                chunk_with_metadata = result.copy()
+                
+                # Ensure standard fields are set with defaults
+                chunk_with_metadata.setdefault("created_at", None)
+                chunk_with_metadata.setdefault("file_path", "unknown_source")
+                chunk_with_metadata["source_type"] = "vector"  # Mark the source type
+                chunk_with_metadata["chunk_id"] = result.get("id")  # Add chunk_id for deduplication
+                
                 valid_chunks.append(chunk_with_metadata)
 
         logger.info(
@@ -3820,13 +3822,8 @@ async def _merge_all_chunks(
             chunk_id = chunk.get("chunk_id") or chunk.get("id")
             if chunk_id and chunk_id not in seen_chunk_ids:
                 seen_chunk_ids.add(chunk_id)
-                merged_chunks.append(
-                    {
-                        "content": chunk["content"],
-                        "file_path": chunk.get("file_path", "unknown_source"),
-                        "chunk_id": chunk_id,
-                    }
-                )
+                # Preserve all fields including Dynamic Fields (file_url, table_name, file_id)
+                merged_chunks.append(chunk.copy())
 
         # Add from entity chunks (Local mode)
         if i < len(entity_chunks):
@@ -3834,13 +3831,8 @@ async def _merge_all_chunks(
             chunk_id = chunk.get("chunk_id") or chunk.get("id")
             if chunk_id and chunk_id not in seen_chunk_ids:
                 seen_chunk_ids.add(chunk_id)
-                merged_chunks.append(
-                    {
-                        "content": chunk["content"],
-                        "file_path": chunk.get("file_path", "unknown_source"),
-                        "chunk_id": chunk_id,
-                    }
-                )
+                # Preserve all fields including Dynamic Fields (file_url, table_name, file_id)
+                merged_chunks.append(chunk.copy())
 
         # Add from relation chunks (Global mode)
         if i < len(relation_chunks):
@@ -3848,13 +3840,8 @@ async def _merge_all_chunks(
             chunk_id = chunk.get("chunk_id") or chunk.get("id")
             if chunk_id and chunk_id not in seen_chunk_ids:
                 seen_chunk_ids.add(chunk_id)
-                merged_chunks.append(
-                    {
-                        "content": chunk["content"],
-                        "file_path": chunk.get("file_path", "unknown_source"),
-                        "chunk_id": chunk_id,
-                    }
-                )
+                # Preserve all fields including Dynamic Fields (file_url, table_name, file_id)
+                merged_chunks.append(chunk.copy())
 
     logger.info(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
@@ -4419,7 +4406,7 @@ async def _find_related_text_unit_from_entities(
     )  # Remove duplicates while preserving order
     chunk_data_list = await text_chunks_db.get_by_ids(unique_chunk_ids)
 
-    # Step 6: Build result chunks with valid data and update chunk tracking
+    # Step 6: Build result chunks with valid data
     result_chunks = []
     for i, (chunk_id, chunk_data) in enumerate(zip(unique_chunk_ids, chunk_data_list)):
         if chunk_data is not None and "content" in chunk_data:
@@ -4433,7 +4420,7 @@ async def _find_related_text_unit_from_entities(
                 chunk_tracking[chunk_id] = {
                     "source": "E",
                     "frequency": chunk_occurrence_count.get(chunk_id, 1),
-                    "order": i + 1,  # 1-based order in final entity-related results
+                    "order": i,
                 }
 
     return result_chunks
@@ -4711,7 +4698,7 @@ async def _find_related_text_unit_from_relations(
     )  # Remove duplicates while preserving order
     chunk_data_list = await text_chunks_db.get_by_ids(unique_chunk_ids)
 
-    # Step 6: Build result chunks with valid data and update chunk tracking
+    # Step 6: Build result chunks with valid data
     result_chunks = []
     for i, (chunk_id, chunk_data) in enumerate(zip(unique_chunk_ids, chunk_data_list)):
         if chunk_data is not None and "content" in chunk_data:
@@ -4725,7 +4712,7 @@ async def _find_related_text_unit_from_relations(
                 chunk_tracking[chunk_id] = {
                     "source": "R",
                     "frequency": chunk_occurrence_count.get(chunk_id, 1),
-                    "order": i + 1,  # 1-based order in final relation-related results
+                    "order": i,
                 }
 
     return result_chunks

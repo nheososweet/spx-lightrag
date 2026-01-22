@@ -3250,15 +3250,8 @@ def convert_to_user_format(
             )
 
     # Convert chunks format (chunks already contain complete data)
-    formatted_chunks = []
-    for i, chunk in enumerate(chunks):
-        chunk_data = {
-            "reference_id": chunk.get("reference_id", ""),
-            "content": chunk.get("content", ""),
-            "file_path": chunk.get("file_path", "unknown_source"),
-            "chunk_id": chunk.get("chunk_id", ""),
-        }
-        formatted_chunks.append(chunk_data)
+    # Preserve ALL fields including Dynamic Fields (file_url, table_name, file_id, etc.)
+    formatted_chunks = [chunk.copy() for chunk in chunks]
 
     logger.debug(
         f"[convert_to_user_format] Formatted {len(formatted_chunks)}/{len(chunks)} chunks"

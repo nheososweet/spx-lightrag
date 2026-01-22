@@ -6,6 +6,7 @@ import asyncio
 from functools import lru_cache
 from lightrag.utils import logger, get_pinyin_sort_key
 import aiofiles
+import aiohttp
 import shutil
 import traceback
 from datetime import datetime, timezone
@@ -20,7 +21,7 @@ from fastapi import (
     HTTPException,
     UploadFile,
 )
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, HttpUrl
 
 from lightrag import LightRAG
 from lightrag.base import DeletionResult, DocProcessingStatus, DocStatus
@@ -236,6 +237,49 @@ class InsertTextRequest(BaseModel):
             "example": {
                 "text": "This is a sample text to be inserted into the RAG system.",
                 "file_source": "Source of the text (optional)",
+            }
+        }
+
+
+class UploadFromURLRequest(BaseModel):
+    """Request model for uploading file from URL with custom metadata
+
+    Attributes:
+        file_url: URL of the file to download and process
+        table_name: Table name for categorizing the document
+        file_id: Unique identifier for the file
+    """
+
+    file_url: str = Field(
+        ..., description="URL of the file to download and process"
+    )
+    table_name: str = Field(..., description="Table name for categorizing the document")
+    file_id: str = Field(..., description="Unique identifier for the file")
+
+    @field_validator("file_url")
+    @classmethod
+    def validate_file_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("file_url cannot be empty")
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("file_url must be a valid HTTP/HTTPS URL")
+        return v
+
+    @field_validator("table_name", "file_id")
+    @classmethod
+    def validate_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Field cannot be empty")
+        return v
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "file_url": "https://example.com/documents/policy.pdf",
+                "table_name": "company_policies",
+                "file_id": "POL_001",
             }
         }
 
@@ -1645,6 +1689,121 @@ async def pipeline_enqueue_file(
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
 
 
+async def pipeline_index_file_with_metadata(
+    rag: LightRAG,
+    file_path: Path,
+    track_id: str,
+    custom_metadata: Dict[str, str],
+):
+    """Index a file with custom metadata injection into Milvus Dynamic Fields
+
+    This function creates a custom chunking function that wraps the default chunking
+    and injects custom metadata (file_url, table_name, file_id) into each chunk.
+    The metadata will be stored in Milvus Dynamic Fields alongside the chunk content.
+
+    Args:
+        rag: LightRAG instance
+        file_path: Path to the saved file
+        track_id: Tracking ID for monitoring progress
+        custom_metadata: Dict containing file_url, table_name, file_id
+
+    Workflow:
+        1. Save original chunking function
+        2. Create wrapper function that injects metadata into each chunk
+        3. Temporarily replace rag's chunking function
+        4. Call standard pipeline_enqueue_file
+        5. Restore original chunking function
+        6. Process the enqueued document
+    """
+    logger.info(f"[METADATA PIPELINE] Starting processing for file: {file_path.name}")
+    logger.info(f"[METADATA PIPELINE] Track ID: {track_id}")
+    logger.info(f"[METADATA PIPELINE] Custom metadata: {custom_metadata}")
+    
+    try:
+        # Save original chunking function
+        logger.info(f"[METADATA PIPELINE] Step 1/5: Saving original chunking function")
+        original_chunking_func = rag.chunking_func
+        logger.debug(f"[METADATA PIPELINE] Original chunking func: {original_chunking_func.__name__}")
+
+        # Create custom chunking wrapper that injects metadata
+        logger.info(f"[METADATA PIPELINE] Step 2/5: Creating metadata injection wrapper")
+        def chunking_with_metadata(
+            tokenizer,
+            content: str,
+            split_by_character: str = None,
+            split_by_character_only: bool = False,
+            chunk_overlap_token_size: int = 100,
+            chunk_token_size: int = 1200,
+        ):
+            """Wrapper chunking function that adds custom metadata to each chunk"""
+            logger.info(f"[METADATA PIPELINE] Chunking content (length: {len(content)} chars)")
+            
+            # Call original chunking function with all parameters
+            chunks = original_chunking_func(
+                tokenizer,
+                content,
+                split_by_character,
+                split_by_character_only,
+                chunk_overlap_token_size,
+                chunk_token_size,
+            )
+            logger.info(f"[METADATA PIPELINE] Original chunking created {len(chunks)} chunks")
+
+            # Inject custom metadata into each chunk
+            logger.info(f"[METADATA PIPELINE] Injecting metadata into {len(chunks)} chunks")
+            for i, chunk in enumerate(chunks):
+                chunk["file_url"] = custom_metadata.get("file_url", "")
+                chunk["table_name"] = custom_metadata.get("table_name", "")
+                chunk["file_id"] = custom_metadata.get("file_id", "")
+                
+                if i == 0:  # Log first chunk as example
+                    logger.debug(
+                        f"[METADATA PIPELINE] Chunk 0 metadata: "
+                        f"file_url={chunk.get('file_url')[:50]}..., "
+                        f"table_name={chunk.get('table_name')}, "
+                        f"file_id={chunk.get('file_id')}"
+                    )
+
+            logger.info(f"[METADATA PIPELINE] Metadata injection completed for {len(chunks)} chunks")
+            return chunks
+
+        # Temporarily replace chunking function
+        logger.info(f"[METADATA PIPELINE] Step 3/5: Replacing chunking function with wrapper")
+        rag.chunking_func = chunking_with_metadata
+
+        try:
+            # Use standard pipeline to enqueue and process
+            logger.info(f"[METADATA PIPELINE] Step 4/5: Enqueueing file for processing")
+            success, returned_track_id = await pipeline_enqueue_file(
+                rag, file_path, track_id
+            )
+            
+            if success:
+                logger.info(f"[METADATA PIPELINE] File enqueued successfully, starting document processing")
+                await rag.apipeline_process_enqueue_documents()
+                logger.info(f"[METADATA PIPELINE] Document processing completed")
+            else:
+                logger.warning(f"[METADATA PIPELINE] File enqueue failed")
+
+            logger.info(
+                f"[METADATA PIPELINE] Step 5/5: Processing completed for {file_path.name}"
+            )
+            logger.info(f"[METADATA PIPELINE] Final metadata stored: {custom_metadata}")
+
+        finally:
+            # Always restore original chunking function
+            logger.info(f"[METADATA PIPELINE] Restoring original chunking function")
+            rag.chunking_func = original_chunking_func
+            logger.debug(f"[METADATA PIPELINE] Chunking function restored")
+
+    except Exception as e:
+        logger.error(
+            f"[METADATA PIPELINE] ❌ ERROR processing file {file_path.name}: {str(e)}"
+        )
+        logger.error(f"[METADATA PIPELINE] Metadata context: {custom_metadata}")
+        logger.error(traceback.format_exc())
+
+
 async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = None):
     """Index a file with track_id
 
@@ -2167,6 +2326,200 @@ def create_document_routes(
 
         except Exception as e:
             logger.error(f"Error /documents/upload: {file.filename}: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/upload_from_url",
+        response_model=InsertResponse,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def upload_from_url(
+        request: UploadFromURLRequest, background_tasks: BackgroundTasks
+    ):
+        """
+        Download file from URL and upload to the RAG system with custom metadata.
+
+        This endpoint downloads a file from the provided URL, saves it to the input directory,
+        and processes it with custom metadata (file_url, table_name, file_id) that will be
+        stored in Milvus Dynamic Fields alongside the chunk content.
+
+        **Workflow:**
+        1. Validate URL and extract filename
+        2. Check for duplicate files (same as /upload)
+        3. Download file from URL to input directory
+        4. Process file with custom metadata injection
+        5. Store file_url, table_name, file_id in Milvus chunks Dynamic Fields
+
+        Args:
+            request (UploadFromURLRequest): Request containing file_url, table_name, file_id
+            background_tasks: FastAPI BackgroundTasks for async processing
+
+        Returns:
+            InsertResponse: Response with upload status and track_id
+                - status="success": File downloaded and queued for processing
+                - status="duplicated": File already exists
+                - status="error": Download or processing failed
+
+        Raises:
+            HTTPException: If URL is invalid (400), download fails (500), or other errors occur
+        """
+        logger.info(f"[UPLOAD FROM URL] ========== NEW REQUEST ==========")
+        logger.info(f"[UPLOAD FROM URL] Received request with:")
+        logger.info(f"[UPLOAD FROM URL]   - file_url: {request.file_url}")
+        logger.info(f"[UPLOAD FROM URL]   - table_name: {request.table_name}")
+        logger.info(f"[UPLOAD FROM URL]   - file_id: {request.file_id}")
+        
+        try:
+            # Extract filename from URL
+            logger.info(f"[UPLOAD FROM URL] Step 1/6: Extracting filename from URL")
+            url_path = request.file_url.rstrip("/")
+            filename = url_path.split("/")[-1]
+            logger.info(f"[UPLOAD FROM URL] Extracted filename: {filename}")
+            
+            if not filename or "." not in filename:
+                logger.error(f"[UPLOAD FROM URL] Invalid filename extracted from URL: {filename}")
+                raise HTTPException(
+                    status_code=400, detail="Cannot extract valid filename from URL"
+                )
+
+            # Sanitize filename
+            logger.info(f"[UPLOAD FROM URL] Step 2/6: Sanitizing filename")
+            safe_filename = sanitize_filename(filename, doc_manager.input_dir)
+            logger.info(f"[UPLOAD FROM URL] Sanitized filename: {safe_filename}")
+
+            logger.info(f"[UPLOAD FROM URL] Step 3/6: Validating file type")
+            if not doc_manager.is_supported_file(safe_filename):
+                logger.error(f"[UPLOAD FROM URL] Unsupported file type: {safe_filename}")
+                logger.error(f"[UPLOAD FROM URL] Supported types: {doc_manager.supported_extensions}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
+                )
+            logger.info(f"[UPLOAD FROM URL] ✓ File type is supported")
+
+            # Check if filename already exists in doc_status storage
+            logger.info(f"[UPLOAD FROM URL] Step 4/6: Checking for duplicates")
+            logger.debug(f"[UPLOAD FROM URL] Checking doc_status storage...")
+            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename)
+            if existing_doc_data:
+                status = existing_doc_data.get("status", "unknown")
+                existing_track_id = existing_doc_data.get("track_id") or ""
+                logger.warning(
+                    f"[UPLOAD FROM URL] ⚠ Duplicate found in doc_status: {safe_filename} (Status: {status}, Track ID: {existing_track_id})"
+                )
+                return InsertResponse(
+                    status="duplicated",
+                    message=f"File '{safe_filename}' already exists in document storage (Status: {status}).",
+                    track_id=existing_track_id,
+                )
+
+            file_path = doc_manager.input_dir / safe_filename
+            logger.debug(f"[UPLOAD FROM URL] Checking file system: {file_path}")
+            if file_path.exists():
+                logger.warning(f"[UPLOAD FROM URL] ⚠ File already exists in file system: {safe_filename}")
+                return InsertResponse(
+                    status="duplicated",
+                    message=f"File '{safe_filename}' already exists in the input directory.",
+                    track_id="",
+                )
+            logger.info(f"[UPLOAD FROM URL] ✓ No duplicates found")
+
+            # Download file from URL
+            logger.info(f"[UPLOAD FROM URL] Step 5/6: Downloading file from URL")
+            logger.info(f"[UPLOAD FROM URL] Target path: {file_path}")
+            
+            downloaded_bytes = 0
+            try:
+                async with aiohttp.ClientSession() as session:
+                    logger.debug(f"[UPLOAD FROM URL] Creating HTTP session...")
+                    async with session.get(request.file_url, timeout=aiohttp.ClientTimeout(total=300)) as response:
+                        logger.info(f"[UPLOAD FROM URL] HTTP Response: {response.status} {response.reason}")
+                        logger.info(f"[UPLOAD FROM URL] Content-Type: {response.headers.get('Content-Type', 'unknown')}")
+                        content_length = response.headers.get('Content-Length')
+                        if content_length:
+                            logger.info(f"[UPLOAD FROM URL] Content-Length: {int(content_length) / 1024:.2f} KB")
+                        
+                        if response.status != 200:
+                            logger.error(f"[UPLOAD FROM URL] Download failed with HTTP {response.status}")
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Failed to download file. HTTP {response.status}: {response.reason}",
+                            )
+
+                        # Save file to disk
+                        logger.info(f"[UPLOAD FROM URL] Starting file write to disk...")
+                        async with aiofiles.open(file_path, "wb") as f:
+                            chunk_count = 0
+                            async for chunk in response.content.iter_chunked(8192):
+                                await f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                                chunk_count += 1
+                                
+                                # Log progress every 100 chunks (~800KB)
+                                if chunk_count % 100 == 0:
+                                    logger.debug(f"[UPLOAD FROM URL] Downloaded {downloaded_bytes / 1024:.2f} KB ({chunk_count} chunks)")
+
+                logger.info(f"[UPLOAD FROM URL] ✓ Download completed: {downloaded_bytes / 1024:.2f} KB")
+                logger.info(f"[UPLOAD FROM URL] ✓ File saved to: {file_path.name}")
+
+            except aiohttp.ClientError as e:
+                logger.error(f"[UPLOAD FROM URL] ❌ Network error during download: {str(e)}")
+                raise HTTPException(
+                    status_code=500, detail=f"Failed to download file from URL: {str(e)}"
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[UPLOAD FROM URL] ❌ Download timeout (max 300s)")
+                raise HTTPException(
+                    status_code=500, detail="File download timed out (max 300s)"
+                )
+
+            # Generate track_id
+            logger.info(f"[UPLOAD FROM URL] Step 6/6: Queuing background processing")
+            track_id = generate_track_id("upload_url")
+            logger.info(f"[UPLOAD FROM URL] Generated track_id: {track_id}")
+
+            # Prepare custom metadata for injection
+            custom_metadata = {
+                "file_url": request.file_url,
+                "table_name": request.table_name,
+                "file_id": request.file_id,
+            }
+            logger.info(f"[UPLOAD FROM URL] Prepared metadata: {custom_metadata}")
+
+            # Add to background tasks with metadata injection
+            logger.info(f"[UPLOAD FROM URL] Adding to background tasks...")
+            background_tasks.add_task(
+                pipeline_index_file_with_metadata,
+                rag,
+                file_path,
+                track_id,
+                custom_metadata,
+            )
+            logger.info(f"[UPLOAD FROM URL] ✓ Background task queued successfully")
+
+            logger.info(f"[UPLOAD FROM URL] ========== REQUEST COMPLETED ==========")
+            logger.info(f"[UPLOAD FROM URL] Summary:")
+            logger.info(f"[UPLOAD FROM URL]   - File: {safe_filename}")
+            logger.info(f"[UPLOAD FROM URL]   - Size: {downloaded_bytes / 1024:.2f} KB")
+            logger.info(f"[UPLOAD FROM URL]   - Track ID: {track_id}")
+            logger.info(f"[UPLOAD FROM URL]   - Metadata: {custom_metadata}")
+            
+            return InsertResponse(
+                status="success",
+                message=f"File '{safe_filename}' downloaded from URL and queued for processing with custom metadata.",
+                track_id=track_id,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[UPLOAD FROM URL] ❌ UNEXPECTED ERROR: {str(e)}")
+            logger.error(f"[UPLOAD FROM URL] Request context:")
+            logger.error(f"[UPLOAD FROM URL]   - file_url: {request.file_url}")
+            logger.error(f"[UPLOAD FROM URL]   - table_name: {request.table_name}")
+            logger.error(f"[UPLOAD FROM URL]   - file_id: {request.file_id}")
+            logger.error(f"[UPLOAD FROM URL] Full traceback:")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

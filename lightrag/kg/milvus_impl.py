@@ -977,6 +977,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         if "created_at" not in self.meta_fields:
             self.meta_fields.add("created_at")
 
+        # Add custom metadata fields for chunks namespace to support Dynamic Fields
+        if self.namespace.endswith("chunks"):
+            self.meta_fields.update(["file_url", "table_name", "file_id", "content"])
+            logger.debug(
+                f"[{self.workspace}] Added custom metadata fields to chunks namespace: file_url, table_name, file_id, content"
+            )
+
         # Initialize client as None - will be created in initialize() method
         self._client = None
         self._max_batch_size = self.global_config["embedding_batch_num"]
@@ -1087,15 +1094,19 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Include all meta_fields (created_at is now always included)
         output_fields = list(self.meta_fields)
 
+        # Build search parameters
+        search_params = {
+            "metric_type": "COSINE",
+            "params": {"radius": self.cosine_better_than_threshold},
+        }
+
+        # Execute search
         results = self._client.search(
             collection_name=self.final_namespace,
             data=embedding,
             limit=top_k,
             output_fields=output_fields,
-            search_params={
-                "metric_type": "COSINE",
-                "params": {"radius": self.cosine_better_than_threshold},
-            },
+            search_params=search_params,
         )
         return [
             {
