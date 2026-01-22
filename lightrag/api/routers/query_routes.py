@@ -110,6 +110,11 @@ class QueryRequest(BaseModel):
         description="If True, enables streaming output for real-time responses. Only affects /query/stream endpoint.",
     )
 
+    table_name: Optional[str] = Field(
+        default=None,
+        description="Optional table name filter for Milvus vector search. When provided, the vector search will only return chunks that have a matching table_name in their dynamic fields. This is useful for filtering search results to a specific document collection or data source.",
+    )
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:

@@ -2646,6 +2646,7 @@ class LightRAG:
             model_func=param.model_func,
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
+            table_name=param.table_name,
         )
 
         query_result = None

@@ -168,6 +168,13 @@ class QueryParam:
     containing citation information for the retrieved content.
     """
 
+    table_name: str | None = None
+    """Optional table name filter for Milvus vector search.
+    When provided, the vector search will only return chunks that have a matching
+    table_name in their dynamic fields. This is useful for filtering search results
+    to a specific document collection or data source.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):

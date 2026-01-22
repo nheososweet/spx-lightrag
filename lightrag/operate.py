@@ -3369,6 +3369,7 @@ async def _get_vector_context(
     chunks_vdb: BaseVectorStorage,
     query_param: QueryParam,
     query_embedding: list[float] = None,
+    filter: str | None = None,
 ) -> list[dict]:
     """
     Retrieve text chunks from the vector database without reranking or truncation.
@@ -3381,6 +3382,7 @@ async def _get_vector_context(
         chunks_vdb: Vector database containing document chunks
         query_param: Query parameters including chunk_top_k and ids
         query_embedding: Optional pre-computed query embedding to avoid redundant embedding calls
+        filter: Optional filter expression to apply to the search.
 
     Returns:
         List of text chunks with metadata
@@ -3391,7 +3393,7 @@ async def _get_vector_context(
         cosine_threshold = chunks_vdb.cosine_better_than_threshold
 
         results = await chunks_vdb.query(
-            query, top_k=search_top_k, query_embedding=query_embedding
+            query, top_k=search_top_k, query_embedding=query_embedding, filter=filter
         )
         if not results:
             logger.info(
@@ -3404,13 +3406,15 @@ async def _get_vector_context(
             if "content" in result:
                 # Preserve all fields from Milvus result (including Dynamic Fields)
                 chunk_with_metadata = result.copy()
-                
+
                 # Ensure standard fields are set with defaults
                 chunk_with_metadata.setdefault("created_at", None)
                 chunk_with_metadata.setdefault("file_path", "unknown_source")
                 chunk_with_metadata["source_type"] = "vector"  # Mark the source type
-                chunk_with_metadata["chunk_id"] = result.get("id")  # Add chunk_id for deduplication
-                
+                chunk_with_metadata["chunk_id"] = result.get(
+                    "id"
+                )  # Add chunk_id for deduplication
+
                 valid_chunks.append(chunk_with_metadata)
 
         logger.info(
@@ -3505,11 +3509,17 @@ async def _perform_kg_search(
 
         # Get vector chunks for mix mode
         if query_param.mode == "mix" and chunks_vdb:
+            # Construct the filter expression if a table_name is provided
+            filter_expression = None
+            if query_param.table_name:
+                filter_expression = f"table_name == '{query_param.table_name}'"
+
             vector_chunks = await _get_vector_context(
                 query,
                 chunks_vdb,
                 query_param,
                 query_embedding,
+                filter=filter_expression,
             )
             # Track vector chunks with source metadata
             for i, chunk in enumerate(vector_chunks):
@@ -3847,6 +3857,19 @@ async def _merge_all_chunks(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
     )
 
+    # Apply table_name filter if specified in query_param
+    # This ensures chunks from KG (entities/relations) are also filtered by table_name
+    if query_param and query_param.table_name:
+        filtered_by_table = [
+            chunk
+            for chunk in merged_chunks
+            if chunk.get("table_name") == query_param.table_name
+        ]
+        logger.info(
+            f"Table name filter applied: {len(merged_chunks)} -> {len(filtered_by_table)} chunks (table_name='{query_param.table_name}')"
+        )
+        merged_chunks = filtered_by_table
+
     return merged_chunks
 
 
@@ -3865,6 +3888,54 @@ async def _build_context_str(
     Build the final LLM context string with token processing.
     This includes dynamic token calculation and final chunk truncation.
     """
+    # Apply table_name filter to entities and relations if specified
+    # This ensures entities/relations from KG are also filtered by table_name
+    if query_param and query_param.table_name and merged_chunks:
+        # Get the set of file_paths from filtered chunks
+        valid_file_paths = {
+            chunk.get("file_path")
+            for chunk in merged_chunks
+            if chunk.get("file_path")
+        }
+
+        if valid_file_paths:
+            # Filter entities by file_path
+            original_entities_count = len(entities_context)
+            entities_context = [
+                entity
+                for entity in entities_context
+                if entity.get("file_path") in valid_file_paths
+            ]
+            logger.info(
+                f"Table name filter applied to entities: {original_entities_count} -> {len(entities_context)} (valid file_paths: {valid_file_paths})"
+            )
+
+            # Filter relations by file_path
+            original_relations_count = len(relations_context)
+            relations_context = [
+                relation
+                for relation in relations_context
+                if relation.get("file_path") in valid_file_paths
+            ]
+            logger.info(
+                f"Table name filter applied to relations: {original_relations_count} -> {len(relations_context)}"
+            )
+
+            # Also filter entity_id_to_original and relation_id_to_original mappings
+            if entity_id_to_original:
+                entity_id_to_original = {
+                    k: v
+                    for k, v in entity_id_to_original.items()
+                    if v.get("file_path") in valid_file_paths
+                }
+
+            if relation_id_to_original:
+                relation_id_to_original = {
+                    k: v
+                    for k, v in relation_id_to_original.items()
+                    if v.get("file_path") in valid_file_paths
+                }
+
     tokenizer = global_config.get("tokenizer")
     if not tokenizer:
         logger.error("Missing tokenizer, cannot build LLM context")
@@ -4786,7 +4857,14 @@ async def naive_query(
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
-    chunks = await _get_vector_context(query, chunks_vdb, query_param, None)
+    # Construct the filter expression if a table_name is provided
+    filter_expression = None
+    if query_param.table_name:
+        filter_expression = f"table_name == '{query_param.table_name}'"
+
+    chunks = await _get_vector_context(
+        query, chunks_vdb, query_param, None, filter=filter_expression
+    )
 
     if chunks is None or len(chunks) == 0:
         logger.info(
