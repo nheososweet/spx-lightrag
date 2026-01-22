@@ -3890,33 +3890,82 @@ async def _build_context_str(
     """
     # Apply table_name filter to entities and relations if specified
     # This ensures entities/relations from KG are also filtered by table_name
+    # Filter by source_id (chunk_ids) instead of file_path for accuracy
     if query_param and query_param.table_name and merged_chunks:
-        # Get the set of file_paths from filtered chunks
+        # Get the set of chunk_ids from filtered chunks
+        valid_chunk_ids = {
+            chunk.get("chunk_id") or chunk.get("id")
+            for chunk in merged_chunks
+            if chunk.get("chunk_id") or chunk.get("id")
+        }
+
+        # Also get file_paths as fallback for entities without source_id
         valid_file_paths = {
             chunk.get("file_path")
             for chunk in merged_chunks
             if chunk.get("file_path")
         }
 
-        if valid_file_paths:
-            # Filter entities by file_path
+        if valid_chunk_ids or valid_file_paths:
+            # Helper function to check if entity/relation source_id overlaps with valid chunks
+            def has_valid_source(item_original: dict) -> bool:
+                """Check if item has source_id that overlaps with valid_chunk_ids or file_path matches"""
+                if not item_original:
+                    return False
+
+                # Primary check: source_id contains any valid chunk_id
+                source_id = item_original.get("source_id", "")
+                if source_id:
+                    # source_id format: "chunk_id1<SEP>chunk_id2<SEP>..."
+                    item_chunk_ids = set(
+                        cid.strip()
+                        for cid in source_id.split(GRAPH_FIELD_SEP)
+                        if cid.strip()
+                    )
+                    if item_chunk_ids & valid_chunk_ids:  # Intersection
+                        return True
+
+                # Fallback check: file_path matches (for backward compatibility)
+                file_path = item_original.get("file_path", "")
+                if file_path:
+                    # file_path can also be SEP-joined
+                    item_file_paths = set(
+                        fp.strip()
+                        for fp in file_path.split(GRAPH_FIELD_SEP)
+                        if fp.strip()
+                    )
+                    if item_file_paths & valid_file_paths:  # Intersection
+                        return True
+
+                return False
+
+            # Filter entities by source_id/file_path
             original_entities_count = len(entities_context)
-            entities_context = [
-                entity
-                for entity in entities_context
-                if entity.get("file_path") in valid_file_paths
-            ]
+            if entity_id_to_original:
+                entities_context = [
+                    entity
+                    for entity in entities_context
+                    if has_valid_source(
+                        entity_id_to_original.get(entity.get("entity"))
+                    )
+                ]
             logger.info(
-                f"Table name filter applied to entities: {original_entities_count} -> {len(entities_context)} (valid file_paths: {valid_file_paths})"
+                f"Table name filter applied to entities: {original_entities_count} -> {len(entities_context)} "
+                f"(valid chunk_ids: {len(valid_chunk_ids)}, valid file_paths: {len(valid_file_paths)})"
             )
 
-            # Filter relations by file_path
+            # Filter relations by source_id/file_path
             original_relations_count = len(relations_context)
-            relations_context = [
-                relation
-                for relation in relations_context
-                if relation.get("file_path") in valid_file_paths
-            ]
+            if relation_id_to_original:
+                relations_context = [
+                    relation
+                    for relation in relations_context
+                    if has_valid_source(
+                        relation_id_to_original.get(
+                            (relation.get("entity1"), relation.get("entity2"))
+                        )
+                    )
+                ]
             logger.info(
                 f"Table name filter applied to relations: {original_relations_count} -> {len(relations_context)}"
             )
@@ -3926,14 +3975,14 @@ async def _build_context_str(
                 entity_id_to_original = {
                     k: v
                     for k, v in entity_id_to_original.items()
-                    if v.get("file_path") in valid_file_paths
+                    if has_valid_source(v)
                 }
 
             if relation_id_to_original:
                 relation_id_to_original = {
                     k: v
                     for k, v in relation_id_to_original.items()
-                    if v.get("file_path") in valid_file_paths
+                    if has_valid_source(v)
                 }
 
     tokenizer = global_config.get("tokenizer")
