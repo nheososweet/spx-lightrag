@@ -990,15 +990,20 @@ def _convert_with_docling(file_path: Path) -> str:
     return result.document.export_to_markdown()
 
 
-def _extract_pdf_pypdf(file_bytes: bytes, password: str = None) -> str:
+def _extract_pdf_pypdf(
+    file_bytes: bytes, password: str = None, return_pages_info: bool = False
+):
     """Extract PDF content using pypdf (synchronous).
 
     Args:
         file_bytes: PDF file content as bytes
         password: Optional password for encrypted PDFs
+        return_pages_info: If True, returns tuple (text, pages_info) for page tracking
 
     Returns:
-        str: Extracted text content
+        str: Extracted text content (if return_pages_info=False)
+        Tuple[str, List[Dict]]: (text, pages_info) if return_pages_info=True
+            pages_info format: [{"page": 1, "char_start": 0, "char_end": 100}, ...]
 
     Raises:
         Exception: If PDF is encrypted and password is incorrect or missing
@@ -1018,11 +1023,43 @@ def _extract_pdf_pypdf(file_bytes: bytes, password: str = None) -> str:
             raise Exception("Incorrect PDF password")
 
     # Extract text from all pages
-    content = ""
-    for page in reader.pages:
-        content += page.extract_text() + "\n"
+    if return_pages_info:
+        # Extract with page tracking
+        full_text = ""
+        pages_info = []
+        current_position = 0
 
-    return content
+        logger.info(f"[PDF EXTRACT] Extracting {len(reader.pages)} pages with page tracking...")
+        
+        for page_num, page in enumerate(reader.pages, start=1):
+            page_text = page.extract_text()
+            page_text_with_newline = page_text + "\n"
+
+            char_start = current_position
+            char_end = current_position + len(page_text_with_newline)
+
+            pages_info.append(
+                {"page": page_num, "char_start": char_start, "char_end": char_end}
+            )
+
+            full_text += page_text_with_newline
+            current_position = char_end
+            
+            if page_num <= 3 or page_num == len(reader.pages):
+                logger.debug(
+                    f"[PDF EXTRACT] Page {page_num}: chars [{char_start}:{char_end}] = {char_end - char_start} chars"
+                )
+
+        logger.info(
+            f"[PDF EXTRACT] Completed: {len(pages_info)} pages, {len(full_text)} total chars"
+        )
+        return full_text, pages_info
+    else:
+        # Original behavior: simple text extraction
+        content = ""
+        for page in reader.pages:
+            content += page.extract_text() + "\n"
+        return content
 
 
 def _extract_docx(file_bytes: bytes) -> str:
@@ -1689,6 +1726,89 @@ async def pipeline_enqueue_file(
                 logger.error(f"Error deleting file {file_path}: {str(e)}")
 
 
+def _is_pdf_file(file_path: Path) -> bool:
+    """Check if file is a PDF by extension and magic bytes.
+    
+    Args:
+        file_path: Path to the file to check
+        
+    Returns:
+        bool: True if file is PDF, False otherwise
+    """
+    # Check extension first (fast check)
+    if file_path.suffix.lower() == ".pdf":
+        return True
+    
+    # Check magic bytes for files without .pdf extension
+    try:
+        with open(file_path, "rb") as f:
+            header = f.read(4)
+            return header == b"%PDF"
+    except Exception:
+        return False
+
+
+def _extract_text_with_virtual_pages(
+    file_bytes: bytes, file_ext: str
+) -> tuple[str, list[dict]]:
+    """Extract text from DOCX/DOC and create virtual pages.
+    
+    Currently only supports DOCX/DOC files.
+    Virtual pages are created by dividing content into logical sections (2000 chars per page).
+    
+    Args:
+        file_bytes: File content as bytes
+        file_ext: File extension (e.g., '.docx')
+        
+    Returns:
+        Tuple of (full_text, pages_info) matching PDF format
+        
+    Raises:
+        ValueError: If file type is not supported
+    """
+    logger.info(f"[PAGE EXTRACT] Extracting text from {file_ext}...")
+    
+    # Only support DOCX/DOC for now
+    if file_ext.lower() not in [".docx", ".doc"]:
+        raise ValueError(
+            f"Virtual page extraction not supported for {file_ext}. "
+            f"Currently only DOCX/DOC files are supported."
+        )
+    
+    try:
+        # Extract text from DOCX/DOC
+        text_content = _extract_docx(file_bytes)
+        full_text = text_content + "\n"
+        
+        # Create virtual pages by dividing text into 2000 char chunks
+        pages_info = []
+        chars_per_page = 2000
+        page_num = 1
+        
+        for page_start in range(0, len(full_text), chars_per_page):
+            page_end = min(page_start + chars_per_page, len(full_text))
+            
+            pages_info.append(
+                {
+                    "page": page_num,
+                    "char_start": page_start,
+                    "char_end": page_end,
+                }
+            )
+            page_num += 1
+        
+        logger.info(
+            f"[PAGE EXTRACT] ✅ Created {len(pages_info)} virtual pages "
+            f"({len(full_text)} chars total)"
+        )
+        
+        return full_text, pages_info
+        
+    except Exception as e:
+        logger.error(f"[PAGE EXTRACT] ❌ Failed to extract pages: {e}")
+        raise
+
+
 async def pipeline_index_file_with_metadata(
     rag: LightRAG,
     file_path: Path,
@@ -1699,6 +1819,7 @@ async def pipeline_index_file_with_metadata(
 
     This function creates a custom chunking function that wraps the default chunking
     and injects custom metadata (file_url, table_name, file_id) into each chunk.
+    For all file types, it extracts text and creates virtual/real pages for page tracking.
     The metadata will be stored in Milvus Dynamic Fields alongside the chunk content.
 
     Args:
@@ -1708,25 +1829,63 @@ async def pipeline_index_file_with_metadata(
         custom_metadata: Dict containing file_url, table_name, file_id
 
     Workflow:
-        1. Save original chunking function
-        2. Create wrapper function that injects metadata into each chunk
-        3. Temporarily replace rag's chunking function
-        4. Call standard pipeline_enqueue_file
-        5. Restore original chunking function
-        6. Process the enqueued document
+        1. Extract text with virtual/real pages from any file type
+        2. Save original chunking function
+        3. Create wrapper function that injects metadata + page numbers into each chunk
+        4. Temporarily replace rag's chunking function
+        5. Call standard pipeline_enqueue_file
+        6. Restore original chunking function
+        7. Process the enqueued document
     """
     logger.info(f"[METADATA PIPELINE] Starting processing for file: {file_path.name}")
     logger.info(f"[METADATA PIPELINE] Track ID: {track_id}")
     logger.info(f"[METADATA PIPELINE] Custom metadata: {custom_metadata}")
     
+    # Store pages_info for page tracking (will be used in chunking wrapper)
+    pages_info_for_tracking = None
+    full_text_for_tracking = None
+    
     try:
+        # Step 1: Extract text with page info
+        logger.info(f"[METADATA PIPELINE] Step 1/7: Extracting text with page tracking...")
+        
+        is_pdf = _is_pdf_file(file_path)
+        file_ext = file_path.suffix
+        
+        try:
+            if is_pdf:
+                # Real PDF - extract with actual pages
+                logger.info(f"[METADATA PIPELINE] PDF file detected, extracting real pages...")
+                file_bytes = file_path.read_bytes()
+                full_text_for_tracking, pages_info_for_tracking = _extract_pdf_pypdf(
+                    file_bytes, 
+                    password=global_args.pdf_decrypt_password,
+                    return_pages_info=True
+                )
+                logger.info(f"[METADATA PIPELINE] ✅ Extracted {len(pages_info_for_tracking)} real PDF pages")
+            else:
+                # Non-PDF - create virtual pages
+                logger.info(f"[METADATA PIPELINE] {file_ext} file detected, creating virtual pages...")
+                file_bytes = file_path.read_bytes()
+                full_text_for_tracking, pages_info_for_tracking = _extract_text_with_virtual_pages(
+                    file_bytes, file_ext
+                )
+                logger.info(f"[METADATA PIPELINE] ✅ Created {len(pages_info_for_tracking)} virtual pages")
+        except Exception as e:
+            logger.warning(
+                f"[METADATA PIPELINE] ⚠️ Failed to extract pages: {e}. "
+                f"Continuing without page tracking."
+            )
+            pages_info_for_tracking = None
+            full_text_for_tracking = None
+        
         # Save original chunking function
-        logger.info(f"[METADATA PIPELINE] Step 1/5: Saving original chunking function")
+        logger.info(f"[METADATA PIPELINE] Step 3/7: Saving original chunking function")
         original_chunking_func = rag.chunking_func
         logger.debug(f"[METADATA PIPELINE] Original chunking func: {original_chunking_func.__name__}")
 
         # Create custom chunking wrapper that injects metadata
-        logger.info(f"[METADATA PIPELINE] Step 2/5: Creating metadata injection wrapper")
+        logger.info(f"[METADATA PIPELINE] Step 4/7: Creating metadata injection wrapper")
         def chunking_with_metadata(
             tokenizer,
             content: str,
@@ -1735,7 +1894,7 @@ async def pipeline_index_file_with_metadata(
             chunk_overlap_token_size: int = 100,
             chunk_token_size: int = 1200,
         ):
-            """Wrapper chunking function that adds custom metadata to each chunk"""
+            """Wrapper chunking function that adds custom metadata + page numbers to each chunk"""
             logger.info(f"[METADATA PIPELINE] Chunking content (length: {len(content)} chars)")
             
             # Call original chunking function with all parameters
@@ -1751,29 +1910,63 @@ async def pipeline_index_file_with_metadata(
 
             # Inject custom metadata into each chunk
             logger.info(f"[METADATA PIPELINE] Injecting metadata into {len(chunks)} chunks")
+            
+            # Log page info availability
+            if pages_info_for_tracking and full_text_for_tracking:
+                logger.info(
+                    f"[METADATA PIPELINE] Page info available: {len(pages_info_for_tracking)} pages, "
+                    f"{len(full_text_for_tracking)} chars total"
+                )
+            else:
+                logger.info("[METADATA PIPELINE] No page info available (extraction failed)")
+            
             for i, chunk in enumerate(chunks):
+                # Inject custom metadata
                 chunk["file_url"] = custom_metadata.get("file_url", "")
                 chunk["table_name"] = custom_metadata.get("table_name", "")
                 chunk["file_id"] = custom_metadata.get("file_id", "")
                 
-                if i == 0:  # Log first chunk as example
-                    logger.debug(
-                        f"[METADATA PIPELINE] Chunk 0 metadata: "
-                        f"file_url={chunk.get('file_url')[:50]}..., "
-                        f"table_name={chunk.get('table_name')}, "
-                        f"file_id={chunk.get('file_id')}"
+                # Inject page numbers
+                if pages_info_for_tracking and full_text_for_tracking:
+                    from lightrag.utils_pdf import assign_page_to_chunk
+                    chunk_text = chunk.get("content", "")
+                    start_page, end_page = assign_page_to_chunk(
+                        chunk_text, full_text_for_tracking, pages_info_for_tracking
+                    )
+                    chunk["start_page"] = start_page
+                    chunk["end_page"] = end_page
+                
+                # Log first chunk with full details
+                if i == 0:
+                    logger.info(
+                        f"[METADATA PIPELINE] Chunk 0 metadata example:\n"
+                        f"  file_url: {chunk.get('file_url')[:60]}...\n"
+                        f"  table_name: {chunk.get('table_name')}\n"
+                        f"  file_id: {chunk.get('file_id')}\n"
+                        f"  start_page: {chunk.get('start_page')}\n"
+                        f"  end_page: {chunk.get('end_page')}\n"
+                        f"  content_preview: {chunk.get('content', '')[:100].replace(chr(10), '↵')}..."
                     )
 
-            logger.info(f"[METADATA PIPELINE] Metadata injection completed for {len(chunks)} chunks")
+            # Summary log
+            if pages_info_for_tracking:
+                page_ranges = [f"{c.get('start_page')}->{c.get('end_page')}" for c in chunks[:5]]
+                logger.info(
+                    f"[METADATA PIPELINE] ✅ Metadata injection completed for {len(chunks)} chunks\n"
+                    f"  First 5 chunks page ranges: {page_ranges}"
+                )
+            else:
+                logger.info(f"[METADATA PIPELINE] ✅ Metadata injection completed for {len(chunks)} chunks (no page info)")
+            
             return chunks
 
         # Temporarily replace chunking function
-        logger.info(f"[METADATA PIPELINE] Step 3/5: Replacing chunking function with wrapper")
+        logger.info(f"[METADATA PIPELINE] Step 5/7: Replacing chunking function with wrapper")
         rag.chunking_func = chunking_with_metadata
 
         try:
             # Use standard pipeline to enqueue and process
-            logger.info(f"[METADATA PIPELINE] Step 4/5: Enqueueing file for processing")
+            logger.info(f"[METADATA PIPELINE] Step 6/7: Enqueueing file for processing")
             success, returned_track_id = await pipeline_enqueue_file(
                 rag, file_path, track_id
             )
@@ -1786,7 +1979,7 @@ async def pipeline_index_file_with_metadata(
                 logger.warning(f"[METADATA PIPELINE] File enqueue failed")
 
             logger.info(
-                f"[METADATA PIPELINE] Step 5/5: Processing completed for {file_path.name}"
+                f"[METADATA PIPELINE] Step 7/7: Processing completed for {file_path.name}"
             )
             logger.info(f"[METADATA PIPELINE] Final metadata stored: {custom_metadata}")
 

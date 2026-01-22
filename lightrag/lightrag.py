@@ -638,7 +638,18 @@ class LightRAG:
             namespace=NameSpace.VECTOR_STORE_CHUNKS,
             workspace=self.workspace,
             embedding_func=self.embedding_func,
-            meta_fields={"full_doc_id", "content", "file_path"},
+            meta_fields={
+                "full_doc_id",
+                "content",
+                "file_path",
+                # PDF page tracking fields
+                "start_page",
+                "end_page",
+                # Custom metadata fields for upload_from_url
+                "file_url",
+                "table_name",
+                "file_id",
+            },
         )
 
         # Initialize document status storage

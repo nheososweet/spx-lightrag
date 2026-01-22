@@ -4420,7 +4420,7 @@ async def _find_related_text_unit_from_entities(
                 chunk_tracking[chunk_id] = {
                     "source": "E",
                     "frequency": chunk_occurrence_count.get(chunk_id, 1),
-                    "order": i,
+                    "order": i + 1,
                 }
 
     return result_chunks
@@ -4712,7 +4712,7 @@ async def _find_related_text_unit_from_relations(
                 chunk_tracking[chunk_id] = {
                     "source": "R",
                     "frequency": chunk_occurrence_count.get(chunk_id, 1),
-                    "order": i,
+                    "order": i + 1,
                 }
 
     return result_chunks
