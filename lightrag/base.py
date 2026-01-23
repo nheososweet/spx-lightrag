@@ -72,6 +72,12 @@ class OllamaServerInfos:
 
 
 class TextChunkSchema(TypedDict):
+    """Schema for text chunks.
+    
+    Note: TypedDict only defines expected fields but doesn't enforce runtime.
+    Additional fields like table_name, file_url, file_id, file_path can be 
+    present in chunk dicts and will be preserved.
+    """
     tokens: int
     content: str
     full_doc_id: str

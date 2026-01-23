@@ -983,6 +983,12 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             logger.debug(
                 f"[{self.workspace}] Added custom metadata fields to chunks namespace: file_url, table_name, file_id, content"
             )
+        # Add table_name field to entities and relationships for multi-tenancy filtering
+        elif self.namespace.endswith("entities") or self.namespace.endswith("relationships"):
+            self.meta_fields.update(["table_name"])
+            logger.debug(
+                f"[{self.workspace}] Added table_name metadata field to {self.namespace} namespace for filtering support"
+            )
 
         # Initialize client as None - will be created in initialize() method
         self._client = None
