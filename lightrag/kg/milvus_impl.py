@@ -1364,6 +1364,85 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return {}
 
+    async def get_doc_ids_by_table_name(self, table_name: str) -> list[str]:
+        """Get unique full_doc_ids by filtering on table_name in dynamic fields.
+        
+        This method queries the chunks collection to find all documents (full_doc_id)
+        that match the given table_name. It uses Milvus query_iterator to handle
+        large result sets efficiently.
+        
+        Args:
+            table_name: The table_name value to filter by (from Milvus dynamic fields)
+            
+        Returns:
+            list[str]: List of unique full_doc_id values matching the table_name
+        """
+        if not self.namespace.endswith("chunks"):
+            logger.warning(
+                f"[{self.workspace}] get_doc_ids_by_table_name is only supported for chunks namespace, "
+                f"current namespace: {self.namespace}"
+            )
+            return []
+        
+        try:
+            # Ensure collection is loaded before querying
+            self._ensure_collection_loaded()
+            
+            # Build filter expression for table_name
+            filter_expr = f'table_name == "{table_name}"'
+            logger.info(
+                f"[{self.workspace}] Querying chunks with table_name='{table_name}'"
+            )
+            
+            # Use query_iterator for potentially large result sets
+            iterator = None
+            doc_ids: set[str] = set()
+            
+            try:
+                iterator = self._client.query_iterator(
+                    collection_name=self.final_namespace,
+                    filter=filter_expr,
+                    batch_size=1000,
+                    output_fields=["full_doc_id"],
+                )
+                
+                batch_num = 0
+                while True:
+                    batch_data = iterator.next()
+                    if not batch_data:
+                        break
+                    
+                    batch_num += 1
+                    for item in batch_data:
+                        if item and "full_doc_id" in item and item["full_doc_id"]:
+                            doc_ids.add(item["full_doc_id"])
+                    
+                    logger.debug(
+                        f"[{self.workspace}] Batch {batch_num}: found {len(batch_data)} chunks, "
+                        f"unique doc_ids so far: {len(doc_ids)}"
+                    )
+                
+            finally:
+                if iterator:
+                    try:
+                        iterator.close()
+                    except Exception as close_error:
+                        logger.warning(
+                            f"[{self.workspace}] Failed to close query iterator: {close_error}"
+                        )
+            
+            result_list = list(doc_ids)
+            logger.info(
+                f"[{self.workspace}] Found {len(result_list)} unique documents with table_name='{table_name}'"
+            )
+            return result_list
+            
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error querying doc_ids by table_name '{table_name}': {e}"
+            )
+            return []
+
     async def drop(self) -> dict[str, str]:
         """Drop all vector data from storage and clean up resources
 

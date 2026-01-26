@@ -3707,6 +3707,254 @@ class LightRAG:
                     pipeline_status["history_messages"].append(completion_msg)
                     logger.info(completion_msg)
 
+    async def adelete_by_table_name(
+        self, table_name: str, delete_llm_cache: bool = False
+    ) -> dict:
+        """Delete all documents that have chunks with a specific table_name in Milvus dynamic fields.
+
+        This method queries the chunks vector database to find all documents (full_doc_id)
+        that have chunks with the specified table_name, then deletes each document
+        using the existing adelete_by_doc_id method.
+
+        **Important**: This method requires Milvus storage for chunks_vdb with table_name
+        stored in dynamic fields. For other storage backends, this method will return an error.
+
+        **Concurrency Control**: This method acquires the pipeline to ensure exclusive access
+        during the deletion operation. It follows the same pattern as batch document deletion.
+
+        Args:
+            table_name (str): The table_name value to filter by (from Milvus dynamic fields).
+                              All documents with chunks matching this table_name will be deleted.
+            delete_llm_cache (bool): Whether to delete cached LLM extraction results
+                associated with the documents. Defaults to False.
+
+        Returns:
+            dict: A dictionary containing:
+                - status (str): "success", "partial_success", "not_found", "not_allowed", or "failure"
+                - table_name (str): The table_name that was targeted for deletion
+                - total_docs (int): Total number of documents found with this table_name
+                - deleted_docs (list): List of successfully deleted document IDs
+                - failed_docs (list): List of document IDs that failed to delete (with error messages)
+                - message (str): Summary message describing the operation result
+        """
+        from lightrag.kg.milvus_impl import MilvusVectorDBStorage
+
+        # Validate that chunks_vdb is Milvus storage
+        if not isinstance(self.chunks_vdb, MilvusVectorDBStorage):
+            return {
+                "status": "failure",
+                "table_name": table_name,
+                "total_docs": 0,
+                "deleted_docs": [],
+                "failed_docs": [],
+                "message": f"delete_by_table_name requires Milvus storage for chunks. "
+                           f"Current storage type: {type(self.chunks_vdb).__name__}",
+            }
+
+        # Get pipeline status for concurrency control
+        pipeline_status = await get_namespace_data(
+            "pipeline_status", workspace=self.workspace
+        )
+        pipeline_status_lock = get_namespace_lock(
+            "pipeline_status", workspace=self.workspace
+        )
+
+        # Check if pipeline is busy
+        async with pipeline_status_lock:
+            if pipeline_status.get("busy", False):
+                return {
+                    "status": "not_allowed",
+                    "table_name": table_name,
+                    "total_docs": 0,
+                    "deleted_docs": [],
+                    "failed_docs": [],
+                    "message": "Cannot delete documents while pipeline is busy",
+                }
+
+        try:
+            # Step 1: Get all doc_ids that have chunks with this table_name
+            logger.info(f"[DELETE BY TABLE] Querying documents with table_name='{table_name}'")
+            doc_ids = await self.chunks_vdb.get_doc_ids_by_table_name(table_name)
+
+            if not doc_ids:
+                logger.info(f"[DELETE BY TABLE] No documents found with table_name='{table_name}'")
+                return {
+                    "status": "not_found",
+                    "table_name": table_name,
+                    "total_docs": 0,
+                    "deleted_docs": [],
+                    "failed_docs": [],
+                    "message": f"No documents found with table_name='{table_name}'",
+                }
+
+            total_docs = len(doc_ids)
+            logger.info(f"[DELETE BY TABLE] Found {total_docs} documents with table_name='{table_name}'")
+
+            # Step 2: Acquire pipeline for batch deletion
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                    return {
+                        "status": "not_allowed",
+                        "table_name": table_name,
+                        "total_docs": total_docs,
+                        "deleted_docs": [],
+                        "failed_docs": [],
+                        "message": "Cannot delete documents while pipeline is busy",
+                    }
+
+                # Set pipeline status for deletion job
+                pipeline_status.update(
+                    {
+                        "busy": True,
+                        "job_name": f"Deleting {total_docs} Documents by table_name",
+                        "job_start": datetime.now(timezone.utc).isoformat(),
+                        "docs": total_docs,
+                        "batchs": total_docs,
+                        "cur_batch": 0,
+                        "request_pending": False,
+                        "cancellation_requested": False,
+                        "latest_message": f"Starting deletion for table_name='{table_name}'",
+                    }
+                )
+                pipeline_status["history_messages"][:] = [
+                    f"Starting deletion for table_name='{table_name}' ({total_docs} documents)"
+                ]
+                if delete_llm_cache:
+                    pipeline_status["history_messages"].append(
+                        "LLM cache cleanup requested for this deletion job"
+                    )
+
+            deleted_docs = []
+            failed_docs = []
+
+            try:
+                # Step 3: Delete each document
+                for i, doc_id in enumerate(doc_ids, 1):
+                    # Check for cancellation
+                    async with pipeline_status_lock:
+                        if pipeline_status.get("cancellation_requested", False):
+                            cancel_msg = (
+                                f"Deletion cancelled by user at document {i}/{total_docs}. "
+                                f"{len(deleted_docs)} deleted, {total_docs - i + 1} remaining."
+                            )
+                            logger.info(cancel_msg)
+                            pipeline_status["latest_message"] = cancel_msg
+                            pipeline_status["history_messages"].append(cancel_msg)
+                            # Add remaining documents to failed list
+                            for remaining_doc_id in doc_ids[i - 1:]:
+                                failed_docs.append({
+                                    "doc_id": remaining_doc_id,
+                                    "error": "Cancelled by user"
+                                })
+                            break
+
+                        # Update progress
+                        progress_msg = f"Deleting document {i}/{total_docs}: {doc_id}"
+                        logger.info(f"[DELETE BY TABLE] {progress_msg}")
+                        pipeline_status["cur_batch"] = i
+                        pipeline_status["latest_message"] = progress_msg
+                        pipeline_status["history_messages"].append(progress_msg)
+
+                    # Delete the document
+                    try:
+                        result = await self.adelete_by_doc_id(
+                            doc_id, delete_llm_cache=delete_llm_cache
+                        )
+
+                        if result.status == "success":
+                            deleted_docs.append(doc_id)
+                            success_msg = f"Successfully deleted document {i}/{total_docs}: {doc_id}"
+                            logger.info(f"[DELETE BY TABLE] {success_msg}")
+                            async with pipeline_status_lock:
+                                pipeline_status["history_messages"].append(success_msg)
+                        else:
+                            failed_docs.append({
+                                "doc_id": doc_id,
+                                "error": result.message
+                            })
+                            fail_msg = f"Failed to delete document {i}/{total_docs}: {doc_id} - {result.message}"
+                            logger.warning(f"[DELETE BY TABLE] {fail_msg}")
+                            async with pipeline_status_lock:
+                                pipeline_status["history_messages"].append(fail_msg)
+
+                    except Exception as doc_error:
+                        failed_docs.append({
+                            "doc_id": doc_id,
+                            "error": str(doc_error)
+                        })
+                        error_msg = f"Error deleting document {i}/{total_docs}: {doc_id} - {str(doc_error)}"
+                        logger.error(f"[DELETE BY TABLE] {error_msg}")
+                        async with pipeline_status_lock:
+                            pipeline_status["history_messages"].append(error_msg)
+
+                # Determine overall status
+                if len(deleted_docs) == total_docs:
+                    status = "success"
+                    message = f"Successfully deleted all {total_docs} documents with table_name='{table_name}'"
+                elif len(deleted_docs) > 0:
+                    status = "partial_success"
+                    message = (
+                        f"Partially deleted documents with table_name='{table_name}': "
+                        f"{len(deleted_docs)}/{total_docs} succeeded, {len(failed_docs)} failed"
+                    )
+                else:
+                    status = "failure"
+                    message = f"Failed to delete any documents with table_name='{table_name}'"
+
+                logger.info(f"[DELETE BY TABLE] {message}")
+
+                return {
+                    "status": status,
+                    "table_name": table_name,
+                    "total_docs": total_docs,
+                    "deleted_docs": deleted_docs,
+                    "failed_docs": failed_docs,
+                    "message": message,
+                }
+
+            finally:
+                # Always release pipeline
+                async with pipeline_status_lock:
+                    pipeline_status["busy"] = False
+                    pipeline_status["cancellation_requested"] = False
+                    completion_msg = f"Deletion by table_name completed: {len(deleted_docs)}/{total_docs} documents deleted"
+                    pipeline_status["latest_message"] = completion_msg
+                    pipeline_status["history_messages"].append(completion_msg)
+                    logger.info(f"[DELETE BY TABLE] {completion_msg}")
+
+        except Exception as e:
+            error_message = f"Error during delete_by_table_name for '{table_name}': {e}"
+            logger.error(f"[DELETE BY TABLE] {error_message}")
+            logger.error(traceback.format_exc())
+            return {
+                "status": "failure",
+                "table_name": table_name,
+                "total_docs": 0,
+                "deleted_docs": [],
+                "failed_docs": [],
+                "message": error_message,
+            }
+
+    def delete_by_table_name(
+        self, table_name: str, delete_llm_cache: bool = False
+    ) -> dict:
+        """Synchronously delete all documents with a specific table_name.
+
+        This is a synchronous wrapper around adelete_by_table_name.
+        See adelete_by_table_name for detailed documentation.
+
+        Args:
+            table_name (str): The table_name value to filter by.
+            delete_llm_cache (bool): Whether to delete cached LLM extraction results.
+
+        Returns:
+            dict: Results of the deletion operation.
+        """
+        loop = always_get_an_event_loop()
+        return loop.run_until_complete(
+            self.adelete_by_table_name(table_name, delete_llm_cache)
+        )
+
     async def adelete_by_entity(self, entity_name: str) -> DeletionResult:
         """Asynchronously delete an entity and all its relationships.
 
