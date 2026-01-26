@@ -1748,6 +1748,77 @@ def _is_pdf_file(file_path: Path) -> bool:
         return False
 
 
+def _convert_docx_to_pdf(docx_path: Path, output_dir: Path = None) -> Path:
+    """Convert DOCX file to PDF.
+    
+    This function converts a DOCX file to PDF format using available conversion libraries.
+    Priority order:
+    1. docx2pdf (Windows with MS Word) - Best quality, preserves formatting
+    2. pypandoc (cross-platform with Pandoc) - Good quality, widely available
+    3. Fallback: Returns original file if conversion fails
+    
+    Args:
+        docx_path: Path to the DOCX file to convert
+        output_dir: Optional output directory (defaults to same directory as input)
+        
+    Returns:
+        Path: Path to the converted PDF file
+        
+    Raises:
+        Exception: If conversion fails completely
+    """
+    logger.info(f"[DOCX->PDF] Starting conversion for: {docx_path.name}")
+    
+    # Determine output path
+    if output_dir is None:
+        output_dir = docx_path.parent
+    
+    # Generate PDF filename (replace .docx with .pdf)
+    pdf_filename = docx_path.stem + ".pdf"
+    pdf_path = output_dir / pdf_filename
+    
+    # Try method 1: docx2pdf (best for Windows with MS Word installed)
+    try:
+        import docx2pdf  # type: ignore
+        logger.info(f"[DOCX->PDF] Using docx2pdf library...")
+        docx2pdf.convert(str(docx_path), str(pdf_path))
+        logger.info(f"[DOCX->PDF] ✅ Conversion successful using docx2pdf")
+        logger.info(f"[DOCX->PDF] Output: {pdf_path.name}")
+        return pdf_path
+    except ImportError:
+        logger.debug(f"[DOCX->PDF] docx2pdf not available, trying next method...")
+    except Exception as e:
+        logger.warning(f"[DOCX->PDF] docx2pdf failed: {e}, trying next method...")
+    
+    # Try method 2: pypandoc (cross-platform with Pandoc)
+    try:
+        import pypandoc  # type: ignore
+        logger.info(f"[DOCX->PDF] Using pypandoc library...")
+        pypandoc.convert_file(
+            str(docx_path),
+            'pdf',
+            outputfile=str(pdf_path),
+            extra_args=['--pdf-engine=pdflatex']  # Requires pdflatex installed
+        )
+        logger.info(f"[DOCX->PDF] ✅ Conversion successful using pypandoc")
+        logger.info(f"[DOCX->PDF] Output: {pdf_path.name}")
+        return pdf_path
+    except ImportError:
+        logger.debug(f"[DOCX->PDF] pypandoc not available, trying next method...")
+    except Exception as e:
+        logger.warning(f"[DOCX->PDF] pypandoc failed: {e}")
+    
+    # If all methods fail, raise exception
+    error_msg = (
+        f"Failed to convert DOCX to PDF. Please install one of:\n"
+        f"  1. docx2pdf (Windows): pip install docx2pdf\n"
+        f"  2. pypandoc (cross-platform): pip install pypandoc (requires Pandoc)\n"
+        f"File: {docx_path.name}"
+    )
+    logger.error(f"[DOCX->PDF] ❌ {error_msg}")
+    raise Exception(error_msg)
+
+
 def _extract_text_with_virtual_pages(
     file_bytes: bytes, file_ext: str
 ) -> tuple[str, list[dict]]:
@@ -1844,17 +1915,45 @@ async def pipeline_index_file_with_metadata(
     # Store pages_info for page tracking (will be used in chunking wrapper)
     pages_info_for_tracking = None
     full_text_for_tracking = None
+    converted_pdf_path = None  # Track converted PDF for cleanup
+    original_docx_path = None  # Track original DOCX file for cleanup
     
     try:
-        # Step 1: Extract text with page info
-        logger.info(f"[METADATA PIPELINE] Step 1/7: Extracting text with page tracking...")
-        
+        # Step 1: Check if DOCX file and convert to PDF if needed
+        file_ext = file_path.suffix.lower()
         is_pdf = _is_pdf_file(file_path)
-        file_ext = file_path.suffix
+        
+        # NEW LOGIC: Convert DOCX to PDF before processing
+        if file_ext in [".docx", ".doc"]:
+            logger.info(f"[METADATA PIPELINE] Step 1a/7: DOCX file detected, converting to PDF...")
+            logger.info(f"[METADATA PIPELINE] Original DOCX file: {file_path.name}")
+            
+            try:
+                # Save reference to original DOCX file for cleanup later
+                original_docx_path = file_path
+                
+                # Convert DOCX to PDF in the same directory
+                converted_pdf_path = _convert_docx_to_pdf(file_path, output_dir=file_path.parent)
+                logger.info(f"[METADATA PIPELINE] ✅ DOCX converted to PDF: {converted_pdf_path.name}")
+                
+                # Update file_path to point to the converted PDF
+                # From now on, process as PDF file
+                file_path = converted_pdf_path
+                is_pdf = True
+                file_ext = ".pdf"
+                logger.info(f"[METADATA PIPELINE] Now processing as PDF file: {file_path.name}")
+            except Exception as e:
+                logger.error(f"[METADATA PIPELINE] ❌ DOCX to PDF conversion failed: {e}")
+                logger.error(f"[METADATA PIPELINE] Cannot proceed without conversion.")
+                raise
+        
+        # Step 2: Extract text with page info (now DOCX is already converted to PDF)
+        logger.info(f"[METADATA PIPELINE] Step 1b/7: Extracting text with page tracking...")
         
         try:
             if is_pdf:
                 # Real PDF - extract with actual pages
+                # This now includes originally DOCX files that were converted to PDF
                 logger.info(f"[METADATA PIPELINE] PDF file detected, extracting real pages...")
                 file_bytes = file_path.read_bytes()
                 full_text_for_tracking, pages_info_for_tracking = _extract_pdf_pypdf(
@@ -1864,7 +1963,7 @@ async def pipeline_index_file_with_metadata(
                 )
                 logger.info(f"[METADATA PIPELINE] ✅ Extracted {len(pages_info_for_tracking)} real PDF pages")
             else:
-                # Non-PDF - create virtual pages
+                # Non-PDF, Non-DOCX files (PPTX, XLSX, etc.) - create virtual pages
                 logger.info(f"[METADATA PIPELINE] {file_ext} file detected, creating virtual pages...")
                 file_bytes = file_path.read_bytes()
                 full_text_for_tracking, pages_info_for_tracking = _extract_text_with_virtual_pages(
@@ -1988,6 +2087,22 @@ async def pipeline_index_file_with_metadata(
             logger.info(f"[METADATA PIPELINE] Restoring original chunking function")
             rag.chunking_func = original_chunking_func
             logger.debug(f"[METADATA PIPELINE] Chunking function restored")
+            
+            # Cleanup: Remove converted PDF if it was created from DOCX
+            if converted_pdf_path and converted_pdf_path.exists():
+                try:
+                    converted_pdf_path.unlink()
+                    logger.info(f"[METADATA PIPELINE] ✅ Cleaned up converted PDF: {converted_pdf_path.name}")
+                except Exception as cleanup_err:
+                    logger.warning(f"[METADATA PIPELINE] Failed to cleanup converted PDF: {cleanup_err}")
+            
+            # Cleanup: Remove original DOCX file after successful conversion and processing
+            if original_docx_path and original_docx_path.exists():
+                try:
+                    original_docx_path.unlink()
+                    logger.info(f"[METADATA PIPELINE] ✅ Cleaned up original DOCX file: {original_docx_path.name}")
+                except Exception as cleanup_err:
+                    logger.warning(f"[METADATA PIPELINE] Failed to cleanup original DOCX: {cleanup_err}")
 
     except Exception as e:
         logger.error(
@@ -1995,6 +2110,22 @@ async def pipeline_index_file_with_metadata(
         )
         logger.error(f"[METADATA PIPELINE] Metadata context: {custom_metadata}")
         logger.error(traceback.format_exc())
+        
+        # Cleanup converted PDF on error
+        if converted_pdf_path and converted_pdf_path.exists():
+            try:
+                converted_pdf_path.unlink()
+                logger.info(f"[METADATA PIPELINE] Cleaned up converted PDF after error")
+            except Exception:
+                pass
+        
+        # Cleanup original DOCX on error
+        if original_docx_path and original_docx_path.exists():
+            try:
+                original_docx_path.unlink()
+                logger.info(f"[METADATA PIPELINE] Cleaned up original DOCX after error")
+            except Exception:
+                pass
 
 
 async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = None):

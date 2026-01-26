@@ -319,6 +319,7 @@ def create_app(args):
         "aws_bedrock",
         "jina",
         "gemini",
+        "custom",
     ]:
         raise Exception("embedding binding not supported")
 
@@ -704,6 +705,10 @@ def create_app(args):
                 from lightrag.llm.lollms import lollms_embed
 
                 provider_func = lollms_embed
+            elif binding == "custom":
+                from lightrag.llm.custom import custom_embed
+
+                provider_func = custom_embed
 
             # Extract attributes if provider is an EmbeddingFunc
             if provider_func and isinstance(provider_func, EmbeddingFunc):
@@ -840,6 +845,24 @@ def create_app(args):
                         "task_type": gemini_options.get(
                             "task_type", "RETRIEVAL_DOCUMENT"
                         ),
+                    }
+                    if model:
+                        kwargs["model"] = model
+                    return await actual_func(**kwargs)
+                elif binding == "custom":
+                    from lightrag.llm.custom import custom_embed
+
+                    actual_func = (
+                        custom_embed.func
+                        if isinstance(custom_embed, EmbeddingFunc)
+                        else custom_embed
+                    )
+                    # Custom embedding with configurable endpoint
+                    kwargs = {
+                        "texts": texts,
+                        "base_url": host,
+                        "api_key": api_key,
+                        "embedding_dim": embedding_dim,
                     }
                     if model:
                         kwargs["model"] = model
