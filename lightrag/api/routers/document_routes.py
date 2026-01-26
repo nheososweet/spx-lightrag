@@ -478,6 +478,7 @@ class DeleteByTableNameRequest(BaseModel):
 
     Attributes:
         table_name: The table_name value to filter by (from Milvus dynamic fields)
+        delete_file: Whether to delete the corresponding files in the upload directory
         delete_llm_cache: Whether to delete cached LLM extraction results
         run_in_background: Whether to run deletion in background (True) or wait for completion (False)
     """
@@ -486,6 +487,10 @@ class DeleteByTableNameRequest(BaseModel):
         ...,
         min_length=1,
         description="The table_name value to filter by. All documents with chunks matching this table_name will be deleted.",
+    )
+    delete_file: bool = Field(
+        default=False,
+        description="Whether to delete the corresponding files in the upload directory.",
     )
     delete_llm_cache: bool = Field(
         default=False,
@@ -507,6 +512,7 @@ class DeleteByTableNameRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "table_name": "company_policies",
+                "delete_file": False,
                 "delete_llm_cache": False,
                 "run_in_background": True,
             }
@@ -3696,7 +3702,9 @@ def create_document_routes(
                 background_tasks.add_task(
                     background_delete_by_table_name,
                     rag,
+                    doc_manager,
                     table_name,
+                    delete_request.delete_file,
                     delete_request.delete_llm_cache,
                 )
 
@@ -3712,7 +3720,9 @@ def create_document_routes(
                 # Run synchronously and wait for completion
                 logger.info(f"Running synchronous deletion for table_name='{table_name}'")
                 result = await rag.adelete_by_table_name(
-                    table_name, delete_llm_cache=delete_request.delete_llm_cache
+                    table_name,
+                    delete_file=delete_request.delete_file,
+                    delete_llm_cache=delete_request.delete_llm_cache,
                 )
 
                 return DeleteByTableNameResponse(

@@ -3708,7 +3708,10 @@ class LightRAG:
                     logger.info(completion_msg)
 
     async def adelete_by_table_name(
-        self, table_name: str, delete_llm_cache: bool = False
+        self,
+        table_name: str,
+        delete_file: bool = False,
+        delete_llm_cache: bool = False,
     ) -> dict:
         """Delete all documents that have chunks with a specific table_name in Milvus dynamic fields.
 
@@ -3725,6 +3728,8 @@ class LightRAG:
         Args:
             table_name (str): The table_name value to filter by (from Milvus dynamic fields).
                               All documents with chunks matching this table_name will be deleted.
+            delete_file (bool): Whether to delete the corresponding files in the upload directory.
+                                Defaults to False.
             delete_llm_cache (bool): Whether to delete cached LLM extraction results
                 associated with the documents. Defaults to False.
 
@@ -3936,7 +3941,10 @@ class LightRAG:
             }
 
     def delete_by_table_name(
-        self, table_name: str, delete_llm_cache: bool = False
+        self,
+        table_name: str,
+        delete_file: bool = False,
+        delete_llm_cache: bool = False,
     ) -> dict:
         """Synchronously delete all documents with a specific table_name.
 
@@ -3945,6 +3953,7 @@ class LightRAG:
 
         Args:
             table_name (str): The table_name value to filter by.
+            delete_file (bool): Whether to delete the corresponding files.
             delete_llm_cache (bool): Whether to delete cached LLM extraction results.
 
         Returns:
@@ -3952,7 +3961,7 @@ class LightRAG:
         """
         loop = always_get_an_event_loop()
         return loop.run_until_complete(
-            self.adelete_by_table_name(table_name, delete_llm_cache)
+            self.adelete_by_table_name(table_name, delete_file, delete_llm_cache)
         )
 
     async def adelete_by_entity(self, entity_name: str) -> DeletionResult:
