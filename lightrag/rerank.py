@@ -513,6 +513,114 @@ async def ali_rerank(
     )
 
 
+async def custom_rerank(
+    query: str,
+    documents: List[str],
+    top_n: Optional[int] = None,
+    api_key: Optional[str] = None,
+    model: str = "custom-rerank",
+    base_url: str = "http://localhost:8000/rerank",
+    extra_body: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Rerank documents using custom self-hosted rerank API.
+    
+    This function handles APIs that return scores in format: {"scores": [0.1, 0.2, ...]}
+    instead of the standard format with results array.
+
+    Args:
+        query: The search query
+        documents: List of strings to rerank
+        top_n: Number of top results to return
+        api_key: API key (optional, use "dummy_key" if not needed)
+        model: Model name (can be any string for self-hosted)
+        base_url: API endpoint URL
+        extra_body: Additional body for http request(reserved for extra params)
+
+    Returns:
+        List of dictionary of ["index": int, "relevance_score": float]
+        
+    Example:
+        >>> # Self-hosted Jina rerank API
+        >>> results = await custom_rerank(
+        ...     query="What is RAG?",
+        ...     documents=["Doc1", "Doc2"],
+        ...     model="jina-reranker-v2",
+        ...     base_url="http://1.34.114.64:62256/rerank",
+        ...     api_key="dummy_key"
+        ... )
+    """
+    if api_key is None:
+        api_key = os.getenv("RERANK_BINDING_API_KEY", "dummy_key")
+
+    if not base_url:
+        raise ValueError("Base URL is required for custom rerank")
+
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "dummy_key":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # Build request payload - simple format for custom API
+    payload = {
+        "query": query,
+        "documents": documents,
+    }
+    
+    # Add model if provided
+    if model:
+        payload["model"] = model
+
+    # Add extra parameters
+    if extra_body:
+        payload.update(extra_body)
+
+    logger.debug(
+        f"Custom rerank request: {len(documents)} documents, endpoint: {base_url}"
+    )
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(base_url, headers=headers, json=payload) as response:
+            if response.status != 200:
+                error_text = await response.text()
+                logger.error(f"Custom rerank API error {response.status}: {error_text}")
+                raise aiohttp.ClientResponseError(
+                    request_info=response.request_info,
+                    history=response.history,
+                    status=response.status,
+                    message=f"Custom rerank API error: {error_text}",
+                )
+
+            response_json = await response.json()
+            
+            # Handle custom format: {"scores": [0.1, 0.2, ...]}
+            scores = response_json.get("scores", [])
+            
+            if not isinstance(scores, list):
+                logger.warning(
+                    f"Expected 'scores' to be list, got {type(scores)}: {scores}"
+                )
+                return []
+            
+            if not scores:
+                logger.warning("Custom rerank API returned empty scores")
+                return []
+            
+            # Convert to standard format with index
+            results = [
+                {"index": idx, "relevance_score": float(score)}
+                for idx, score in enumerate(scores)
+            ]
+            
+            # Sort by relevance score (descending)
+            results.sort(key=lambda x: x["relevance_score"], reverse=True)
+            
+            # Apply top_n if specified
+            if top_n is not None and len(results) > top_n:
+                results = results[:top_n]
+            
+            return results
+
+
 """Please run this test as a module:
 python -m lightrag.rerank
 """

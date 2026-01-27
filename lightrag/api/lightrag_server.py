@@ -999,13 +999,14 @@ def create_app(args):
     # Configure rerank function based on args.rerank_bindingparameter
     rerank_model_func = None
     if args.rerank_binding != "null":
-        from lightrag.rerank import cohere_rerank, jina_rerank, ali_rerank
+        from lightrag.rerank import cohere_rerank, jina_rerank, ali_rerank, custom_rerank
 
         # Map rerank binding to corresponding function
         rerank_functions = {
             "cohere": cohere_rerank,
             "jina": jina_rerank,
             "aliyun": ali_rerank,
+            "custom": custom_rerank,
         }
 
         # Select the appropriate rerank function based on binding
