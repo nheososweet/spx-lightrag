@@ -248,6 +248,7 @@ class UploadFromURLRequest(BaseModel):
         file_url: URL of the file to download and process
         table_name: Table name for categorizing the document
         file_id: Unique identifier for the file
+        run_background: Whether to process in background (True) or wait for completion (False)
     """
 
     file_url: str = Field(
@@ -255,6 +256,10 @@ class UploadFromURLRequest(BaseModel):
     )
     table_name: str = Field(..., description="Table name for categorizing the document")
     file_id: str = Field(..., description="Unique identifier for the file")
+    run_background: bool = Field(
+        default=True,
+        description="If True, process in background and return immediately. If False, wait for processing to complete."
+    )
 
     @field_validator("file_url")
     @classmethod
@@ -280,6 +285,79 @@ class UploadFromURLRequest(BaseModel):
                 "file_url": "https://example.com/documents/policy.pdf",
                 "table_name": "company_policies",
                 "file_id": "POL_001",
+                "run_background": False,
+            }
+        }
+
+
+class ReplaceFileByIdRequest(BaseModel):
+    """Request model for replacing a file by deleting old file_id and uploading with new file_id
+    
+    This operation performs two steps:
+    1. Delete all documents associated with old_file_id
+    2. Upload new file with new file_id (from body, not from URL)
+    
+    Attributes:
+        old_file_id: OLD file_id to delete (must exist in system)
+        file_id: NEW file_id for the uploaded file (provided by frontend/S3)
+        file_url: URL of the new file to download and process
+        table_name: Table name for categorizing the new document
+        run_background: Whether to process in background (True) or wait for completion (False)
+        delete_llm_cache: Whether to delete cached LLM extraction results from old file
+    """
+    
+    old_file_id: str = Field(
+        ..., 
+        description="OLD file_id to delete. Must match an existing file_id in the system."
+    )
+    file_id: str = Field(
+        ..., 
+        description="NEW file_id for the uploaded file. This will be used in metadata."
+    )
+    file_url: str = Field(
+        ..., 
+        description="URL of the new file to download and process"
+    )
+    table_name: str = Field(
+        ..., 
+        description="Table name for categorizing the new document"
+    )
+    run_background: bool = Field(
+        default=True,
+        description="If True, process in background. If False, wait for completion."
+    )
+    delete_llm_cache: bool = Field(
+        default=True,
+        description="If True, delete LLM extraction cache from old file to ensure fresh processing."
+    )
+    
+    @field_validator("file_url")
+    @classmethod
+    def validate_file_url(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("file_url cannot be empty")
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("file_url must be a valid HTTP/HTTPS URL")
+        return v
+    
+    @field_validator("table_name", "file_id", "old_file_id")
+    @classmethod
+    def validate_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Field cannot be empty")
+        return v
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "old_file_id": "cab4fa00-e0bb-41bb-8b2b-45a5c46041d2",
+                "file_id": "c7a24784-9402-4bdd-98a7-d03a9a53e7cd",
+                "file_url": "https://s3.../documents/report_v2.pdf",
+                "table_name": "company_policies",
+                "run_background": False,
+                "delete_llm_cache": True,
             }
         }
 
@@ -2805,21 +2883,29 @@ def create_document_routes(
         1. Validate URL and extract filename
         2. Check for duplicate files (same as /upload)
         3. Download file from URL to input directory
-        4. Process file with custom metadata injection
+        4. Process file with custom metadata injection (if run_background=true)
         5. Store file_url, table_name, file_id in Milvus chunks Dynamic Fields
 
+        **Processing Modes:**
+        - `run_background=true` (default): File is queued for background processing, returns immediately with track_id
+        - `run_background=false`: Waits for file processing to complete before returning (useful for FE workers)
+
         Args:
-            request (UploadFromURLRequest): Request containing file_url, table_name, file_id
-            background_tasks: FastAPI BackgroundTasks for async processing
+            request (UploadFromURLRequest): Request containing:
+                - file_url: URL of the file to download
+                - table_name: Table name for categorizing the document
+                - file_id: Unique identifier for the file
+                - run_background: Whether to process in background (True) or wait for completion (False)
+            background_tasks: FastAPI BackgroundTasks for async processing (used only when run_background=true)
 
         Returns:
             InsertResponse: Response with upload status and track_id
-                - status="success": File downloaded and queued for processing
+                - status="success": File downloaded and queued/processed successfully
                 - status="duplicated": File already exists
-                - status="error": Download or processing failed
+                - track_id: Unique identifier to track document processing status
 
         Raises:
-            HTTPException: If URL is invalid (400), download fails (500), or other errors occur
+            HTTPException: If URL is invalid (400), download fails (500), processing fails (500), or other errors occur
         """
         logger.info(f"[UPLOAD FROM URL] ========== NEW REQUEST ==========")
         logger.info(f"[UPLOAD FROM URL] Received request with:")
@@ -2944,16 +3030,38 @@ def create_document_routes(
             }
             logger.info(f"[UPLOAD FROM URL] Prepared metadata: {custom_metadata}")
 
-            # Add to background tasks with metadata injection
-            logger.info(f"[UPLOAD FROM URL] Adding to background tasks...")
-            background_tasks.add_task(
-                pipeline_index_file_with_metadata,
-                rag,
-                file_path,
-                track_id,
-                custom_metadata,
-            )
-            logger.info(f"[UPLOAD FROM URL] ✓ Background task queued successfully")
+            # Check if should run in background or wait for completion
+            if request.run_background:
+                # Add to background tasks with metadata injection (original behavior)
+                logger.info(f"[UPLOAD FROM URL] Adding to background tasks...")
+                background_tasks.add_task(
+                    pipeline_index_file_with_metadata,
+                    rag,
+                    file_path,
+                    track_id,
+                    custom_metadata,
+                )
+                logger.info(f"[UPLOAD FROM URL] ✓ Background task queued successfully")
+                message = f"File '{safe_filename}' downloaded from URL and queued for processing with custom metadata."
+            else:
+                # Process synchronously and wait for completion (for FE worker)
+                logger.info(f"[UPLOAD FROM URL] Processing synchronously (run_background=False)...")
+                try:
+                    await pipeline_index_file_with_metadata(
+                        rag,
+                        file_path,
+                        track_id,
+                        custom_metadata,
+                    )
+                    logger.info(f"[UPLOAD FROM URL] ✓ Synchronous processing completed successfully")
+                    message = f"File '{safe_filename}' downloaded from URL and processed successfully with custom metadata."
+                except Exception as e:
+                    logger.error(f"[UPLOAD FROM URL] ❌ Synchronous processing failed: {str(e)}")
+                    logger.error(traceback.format_exc())
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"File processing failed: {str(e)}"
+                    )
 
             logger.info(f"[UPLOAD FROM URL] ========== REQUEST COMPLETED ==========")
             logger.info(f"[UPLOAD FROM URL] Summary:")
@@ -2961,10 +3069,11 @@ def create_document_routes(
             logger.info(f"[UPLOAD FROM URL]   - Size: {downloaded_bytes / 1024:.2f} KB")
             logger.info(f"[UPLOAD FROM URL]   - Track ID: {track_id}")
             logger.info(f"[UPLOAD FROM URL]   - Metadata: {custom_metadata}")
+            logger.info(f"[UPLOAD FROM URL]   - Run background: {request.run_background}")
             
             return InsertResponse(
                 status="success",
-                message=f"File '{safe_filename}' downloaded from URL and queued for processing with custom metadata.",
+                message=message,
                 track_id=track_id,
             )
 
@@ -4078,6 +4187,320 @@ def create_document_routes(
 
         except Exception as e:
             logger.error(f"Error initiating reprocessing of failed documents: {str(e)}")
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=str(e))
+
+    @router.post(
+        "/replace_file_by_id",
+        response_model=dict,
+        dependencies=[Depends(combined_auth)],
+    )
+    async def replace_file_by_id(
+        request: ReplaceFileByIdRequest, background_tasks: BackgroundTasks
+    ):
+        """
+        Replace an existing file by deleting old version and uploading new version.
+
+        This endpoint performs a two-step operation:
+        1. **Delete**: Remove all documents associated with the specified file_id
+           (including chunks, entities, relationships, and optionally LLM cache)
+        2. **Upload**: Download and process the new file with the same file_id
+
+        This is useful for updating documents while maintaining the same file_id reference,
+        ensuring consistency with external systems that track files by file_id.
+
+        **Important Notes:**
+        - The file_id must exist in the system (have associated documents)
+        - If deletion succeeds but upload fails, the old data is already removed
+        - Use run_background=False if you need to ensure both operations complete
+        - Set delete_llm_cache=True (default) to ensure fresh extraction of new file
+
+        **Workflow:**
+        1. Validate file_id exists and has documents
+        2. Delete all documents with matching file_id
+        3. Download new file from URL
+        4. Process new file with same file_id and table_name metadata
+
+        **Processing Modes:**
+        - `run_background=true` (default): Both delete and upload happen in background
+        - `run_background=false`: Wait for both operations to complete before returning
+
+        Args:
+            request (ReplaceFileByIdRequest): Request containing:
+                - file_id: Unique identifier of file to replace (must exist)
+                - file_url: URL of new file to download
+                - table_name: Table name for new document
+                - run_background: Whether to process in background
+                - delete_llm_cache: Whether to delete old LLM extraction cache
+            background_tasks: FastAPI BackgroundTasks (used only when run_background=true)
+
+        Returns:
+            dict: Response containing:
+                - status: "success", "not_found", "partial_success", or "failure"
+                - file_id: The file_id that was replaced
+                - deletion_result: Details of old file deletion
+                - upload_result: Details of new file upload (if successful)
+                - message: Summary of the operation
+                - track_id: Track ID for new upload (for monitoring progress)
+
+        Raises:
+            HTTPException: 
+                - 404: If file_id not found
+                - 500: If deletion or upload fails
+
+        Example:
+            >>> # Replace file synchronously (wait for completion)
+            >>> response = await replace_file_by_id({
+            ...     "file_id": "POL_001",
+            ...     "file_url": "https://example.com/policy_v2.pdf",
+            ...     "table_name": "policies",
+            ...     "run_background": False,
+            ...     "delete_llm_cache": True
+            ... })
+        """
+        logger.info(f"[REPLACE FILE] ========== NEW REQUEST ==========")
+        logger.info(f"[REPLACE FILE] Received request:")
+        logger.info(f"[REPLACE FILE]   - old_file_id: {request.old_file_id} (to delete)")
+        logger.info(f"[REPLACE FILE]   - file_id: {request.file_id} (new upload)")
+        logger.info(f"[REPLACE FILE]   - file_url: {request.file_url}")
+        logger.info(f"[REPLACE FILE]   - table_name: {request.table_name}")
+        logger.info(f"[REPLACE FILE]   - run_background: {request.run_background}")
+        logger.info(f"[REPLACE FILE]   - delete_llm_cache: {request.delete_llm_cache}")
+
+        try:
+            # ===================================================================
+            # STEP 0: CHECK DUPLICATE - NEW file_id/file_url already exists?
+            # ===================================================================
+            logger.info(f"[REPLACE FILE] Step 0/3: Checking if NEW file_id/file_url already exists...")
+            
+            # Import Milvus check
+            from lightrag.kg.milvus_impl import MilvusVectorDBStorage
+            
+            if not isinstance(rag.chunks_vdb, MilvusVectorDBStorage):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"replace_file_by_id requires Milvus storage. Current: {type(rag.chunks_vdb).__name__}"
+                )
+            
+            # Check 1: NEW file_id already exists in system?
+            try:
+                existing_doc_ids = await rag.chunks_vdb.get_doc_ids_by_file_id(request.file_id)
+                if existing_doc_ids and len(existing_doc_ids) > 0:
+                    logger.warning(f"[REPLACE FILE] NEW file_id '{request.file_id}' already exists ({len(existing_doc_ids)} docs)")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot replace: NEW file_id='{request.file_id}' already exists with {len(existing_doc_ids)} document(s). Please use a different file_id or delete the existing file first."
+                    )
+            except Exception as e:
+                if "HTTP" in str(type(e).__name__):
+                    raise
+                logger.error(f"[REPLACE FILE] Error checking file_id duplicate: {e}")
+                raise HTTPException(status_code=500, detail=f"Error checking duplicate file_id: {str(e)}")
+            
+            # Check 2: NEW file_url already exists in system?
+            try:
+                existing_doc_ids_url = await rag.chunks_vdb.get_doc_ids_by_file_url(request.file_url)
+                if existing_doc_ids_url and len(existing_doc_ids_url) > 0:
+                    logger.warning(f"[REPLACE FILE] NEW file_url already exists ({len(existing_doc_ids_url)} docs)")
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Cannot replace: file_url already exists with {len(existing_doc_ids_url)} document(s). This would create a duplicate."
+                    )
+            except Exception as e:
+                if "HTTP" in str(type(e).__name__):
+                    raise
+                logger.error(f"[REPLACE FILE] Error checking file_url duplicate: {e}")
+                raise HTTPException(status_code=500, detail=f"Error checking duplicate file_url: {str(e)}")
+            
+            logger.info(f"[REPLACE FILE] ✓ No duplicate found, safe to proceed")
+            
+            # ===================================================================
+            # STEP 1: DELETE OLD FILE BY old_file_id
+            # ===================================================================
+            logger.info(f"[REPLACE FILE] Step 1/3: Deleting old documents with old_file_id='{request.old_file_id}'")
+            
+            # Call adelete_by_file_id to remove all old documents
+            deletion_result = await rag.adelete_by_file_id(
+                file_id=request.old_file_id,
+                delete_file=False,  # Don't delete physical file (may not exist for URL uploads)
+                delete_llm_cache=request.delete_llm_cache,
+            )
+            
+            logger.info(f"[REPLACE FILE] Deletion result: {deletion_result['status']}")
+            logger.info(f"[REPLACE FILE] Deleted {len(deletion_result['deleted_docs'])} documents")
+            
+            # Handle case: old_file_id not found
+            if deletion_result["status"] == "not_found":
+                logger.warning(f"[REPLACE FILE] Old_file_id '{request.old_file_id}' not found")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No documents found with old_file_id='{request.old_file_id}'. Cannot replace non-existent file."
+                )
+            
+            # Handle case: deletion failed
+            if deletion_result["status"] == "failure":
+                logger.error(f"[REPLACE FILE] Deletion failed: {deletion_result['message']}")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to delete old file: {deletion_result['message']}"
+                )
+            
+            # Log partial success (some documents failed to delete)
+            if deletion_result["status"] == "partial_success":
+                logger.warning(
+                    f"[REPLACE FILE] Partial deletion: {len(deletion_result['deleted_docs'])}/{deletion_result['total_docs']} succeeded"
+                )
+            
+            # ===================================================================
+            # STEP 2: UPLOAD NEW FILE WITH NEW file_id (from request body)
+            # ===================================================================
+            logger.info(f"[REPLACE FILE] Step 2/3: Uploading new file")
+            
+            # Extract filename from URL for processing
+            url_path = request.file_url.rstrip("/")
+            filename = url_path.split("/")[-1]
+            
+            if not filename or "." not in filename:
+                logger.error(f"[REPLACE FILE] Invalid filename from URL: {filename}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail="Cannot extract valid filename from URL"
+                )
+            
+            # Sanitize filename
+            safe_filename = sanitize_filename(filename, doc_manager.input_dir)
+            logger.info(f"[REPLACE FILE] New filename: {safe_filename}")
+            
+            # Validate file type
+            if not doc_manager.is_supported_file(safe_filename):
+                logger.error(f"[REPLACE FILE] Unsupported file type: {safe_filename}")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type. Supported: {doc_manager.supported_extensions}"
+                )
+            
+            file_path = doc_manager.input_dir / safe_filename
+            
+            # Download new file from URL
+            logger.info(f"[REPLACE FILE] Downloading new file from URL...")
+            downloaded_bytes = 0
+            
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        request.file_url, 
+                        timeout=aiohttp.ClientTimeout(total=300)
+                    ) as response:
+                        if response.status != 200:
+                            logger.error(f"[REPLACE FILE] Download failed: HTTP {response.status}")
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Failed to download new file. HTTP {response.status}: {response.reason}"
+                            )
+                        
+                        # Save file to disk
+                        async with aiofiles.open(file_path, "wb") as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                await f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                
+                logger.info(f"[REPLACE FILE] Downloaded {downloaded_bytes / 1024:.2f} KB")
+                
+            except aiohttp.ClientError as e:
+                logger.error(f"[REPLACE FILE] Download error: {str(e)}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"Failed to download new file: {str(e)}"
+                )
+            except asyncio.TimeoutError:
+                logger.error(f"[REPLACE FILE] Download timeout")
+                raise HTTPException(
+                    status_code=500, 
+                    detail="New file download timed out (max 300s)"
+                )
+            
+            # Generate new track_id for upload
+            track_id = generate_track_id("replace")
+            logger.info(f"[REPLACE FILE] Generated track_id: {track_id}")
+            
+            # Prepare metadata with NEW file_id (from request body, same as upload_from_url)
+            new_file_id = request.file_id  # NEW file_id provided by frontend
+            logger.info(f"[REPLACE FILE] Using NEW file_id from request: {new_file_id}")
+            logger.info(f"[REPLACE FILE] File ID mapping: {request.old_file_id} (old) → {new_file_id} (new)")
+            
+            custom_metadata = {
+                "file_url": request.file_url,
+                "table_name": request.table_name,
+                "file_id": new_file_id,  # Use NEW file_id from request body
+            }
+            
+            # Process new file (background or synchronous based on flag)
+            if request.run_background:
+                # Background processing
+                logger.info(f"[REPLACE FILE] Adding upload to background tasks")
+                background_tasks.add_task(
+                    pipeline_index_file_with_metadata,
+                    rag,
+                    file_path,
+                    track_id,
+                    custom_metadata,
+                )
+                upload_message = "New file queued for background processing"
+            else:
+                # Synchronous processing
+                logger.info(f"[REPLACE FILE] Processing new file synchronously")
+                try:
+                    await pipeline_index_file_with_metadata(
+                        rag,
+                        file_path,
+                        track_id,
+                        custom_metadata,
+                    )
+                    upload_message = "New file processed successfully"
+                    logger.info(f"[REPLACE FILE] ✓ Synchronous upload completed")
+                except Exception as upload_error:
+                    logger.error(f"[REPLACE FILE] Upload failed: {str(upload_error)}")
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"New file upload failed: {str(upload_error)}"
+                    )
+            
+            # ===================================================================
+            # STEP 3: RETURN COMBINED RESULT
+            # ===================================================================
+            logger.info(f"[REPLACE FILE] ========== REQUEST COMPLETED ==========")
+            logger.info(f"[REPLACE FILE] Summary:")
+            logger.info(f"[REPLACE FILE]   - Old file_id: {request.old_file_id}")
+            logger.info(f"[REPLACE FILE]   - New file_id: {new_file_id}")
+            logger.info(f"[REPLACE FILE]   - Old docs deleted: {len(deletion_result['deleted_docs'])}")
+            logger.info(f"[REPLACE FILE]   - New file: {safe_filename}")
+            logger.info(f"[REPLACE FILE]   - Track ID: {track_id}")
+            
+            return {
+                "status": "success",
+                "old_file_id": request.old_file_id,  # Return old file_id for tracking
+                "new_file_id": new_file_id,          # Return new file_id for frontend update
+                "deletion_result": {
+                    "status": deletion_result["status"],
+                    "total_docs": deletion_result["total_docs"],
+                    "deleted_count": len(deletion_result["deleted_docs"]),
+                    "failed_count": len(deletion_result["failed_docs"]),
+                },
+                "upload_result": {
+                    "filename": safe_filename,
+                    "size_kb": downloaded_bytes / 1024,
+                    "message": upload_message,
+                },
+                "message": f"Successfully deleted old file_id='{request.old_file_id}' ({len(deletion_result['deleted_docs'])} docs) and uploaded new file with file_id='{new_file_id}'",
+                "track_id": track_id,
+            }
+
+        except HTTPException:
+            # Re-raise HTTP exceptions (already logged)
+            raise
+        except Exception as e:
+            # Handle unexpected errors
+            logger.error(f"[REPLACE FILE] ❌ UNEXPECTED ERROR: {str(e)}")
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 

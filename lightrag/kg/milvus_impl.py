@@ -1443,6 +1443,194 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return []
 
+    async def get_doc_ids_by_file_id(self, file_id: str) -> list[str]:
+        """Get unique full_doc_ids by filtering on file_id in dynamic fields.
+        
+        This method queries the chunks collection to find all documents (full_doc_id)
+        that match the given file_id. It uses Milvus query_iterator to handle
+        large result sets efficiently.
+        
+        This is used for replacing/deleting files by their unique file_id identifier,
+        which is stored in Milvus dynamic fields when documents are uploaded via
+        the upload_from_url endpoint.
+        
+        Args:
+            file_id: The file_id value to filter by (from Milvus dynamic fields)
+            
+        Returns:
+            list[str]: List of unique full_doc_id values matching the file_id
+            
+        Note:
+            - Only works for chunks namespace (validated at start)
+            - Returns empty list if namespace is incorrect or query fails
+            - Uses batched iteration to handle large datasets efficiently
+        """
+        # Validate namespace - file_id is only stored in chunks collection
+        if not self.namespace.endswith("chunks"):
+            logger.warning(
+                f"[{self.workspace}] get_doc_ids_by_file_id is only supported for chunks namespace, "
+                f"current namespace: {self.namespace}"
+            )
+            return []
+        
+        try:
+            # Ensure collection is loaded before querying
+            self._ensure_collection_loaded()
+            
+            # Build filter expression for file_id (exact match in dynamic fields)
+            filter_expr = f'file_id == "{file_id}"'
+            logger.info(
+                f"[{self.workspace}] Querying chunks with file_id='{file_id}'"
+            )
+            
+            # Use query_iterator for potentially large result sets
+            # This prevents memory issues when a file has many chunks
+            iterator = None
+            doc_ids: set[str] = set()  # Use set to automatically deduplicate
+            
+            try:
+                iterator = self._client.query_iterator(
+                    collection_name=self.final_namespace,
+                    filter=filter_expr,
+                    batch_size=1000,  # Process 1000 chunks at a time
+                    output_fields=["full_doc_id"],  # Only fetch what we need
+                )
+                
+                batch_num = 0
+                while True:
+                    # Fetch next batch of matching chunks
+                    batch_data = iterator.next()
+                    if not batch_data:
+                        break  # No more data
+                    
+                    batch_num += 1
+                    # Extract doc_ids from batch (automatically deduplicates via set)
+                    for item in batch_data:
+                        if item and "full_doc_id" in item and item["full_doc_id"]:
+                            doc_ids.add(item["full_doc_id"])
+                    
+                    logger.debug(
+                        f"[{self.workspace}] Batch {batch_num}: found {len(batch_data)} chunks, "
+                        f"unique doc_ids so far: {len(doc_ids)}"
+                    )
+                
+            finally:
+                # Always close iterator to free resources
+                if iterator:
+                    try:
+                        iterator.close()
+                    except Exception as close_error:
+                        logger.warning(
+                            f"[{self.workspace}] Failed to close query iterator: {close_error}"
+                        )
+            
+            # Convert set to list for return
+            result_list = list(doc_ids)
+            logger.info(
+                f"[{self.workspace}] Found {len(result_list)} unique documents with file_id='{file_id}'"
+            )
+            return result_list
+            
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error querying doc_ids by file_id '{file_id}': {e}"
+            )
+            return []
+
+    async def get_doc_ids_by_file_url(self, file_url: str) -> list[str]:
+        """Get unique full_doc_ids by filtering on file_url in dynamic fields.
+        
+        This method queries the chunks collection to find all documents (full_doc_id)
+        that match the given file_url. It uses Milvus query_iterator to handle
+        large result sets efficiently.
+        
+        This is used for checking duplicate file_url before replacing files,
+        which is stored in Milvus dynamic fields when documents are uploaded via
+        the upload_from_url endpoint.
+        
+        Args:
+            file_url: The file_url value to filter by (from Milvus dynamic fields)
+            
+        Returns:
+            list[str]: List of unique full_doc_id values matching the file_url
+            
+        Note:
+            - Only works for chunks namespace (validated at start)
+            - Returns empty list if namespace is incorrect or query fails
+            - Uses batched iteration to handle large datasets efficiently
+        """
+        # Validate namespace - file_url is only stored in chunks collection
+        if not self.namespace.endswith("chunks"):
+            logger.warning(
+                f"[{self.workspace}] get_doc_ids_by_file_url is only supported for chunks namespace, "
+                f"current namespace: {self.namespace}"
+            )
+            return []
+        
+        try:
+            # Ensure collection is loaded before querying
+            self._ensure_collection_loaded()
+            
+            # Build filter expression for file_url (exact match in dynamic fields)
+            # Note: file_url may contain special characters, use proper escaping
+            filter_expr = f'file_url == "{file_url}"'
+            logger.info(
+                f"[{self.workspace}] Querying chunks with file_url='{file_url}'"
+            )
+            
+            # Use query_iterator for potentially large result sets
+            iterator = None
+            doc_ids: set[str] = set()  # Use set to automatically deduplicate
+            
+            try:
+                iterator = self._client.query_iterator(
+                    collection_name=self.final_namespace,
+                    filter=filter_expr,
+                    batch_size=1000,  # Process 1000 chunks at a time
+                    output_fields=["full_doc_id"],  # Only fetch what we need
+                )
+                
+                batch_num = 0
+                while True:
+                    # Fetch next batch of matching chunks
+                    batch_data = iterator.next()
+                    if not batch_data:
+                        break  # No more data
+                    
+                    batch_num += 1
+                    # Extract doc_ids from batch (automatically deduplicates via set)
+                    for item in batch_data:
+                        if item and "full_doc_id" in item and item["full_doc_id"]:
+                            doc_ids.add(item["full_doc_id"])
+                    
+                    logger.debug(
+                        f"[{self.workspace}] Batch {batch_num}: found {len(batch_data)} chunks, "
+                        f"unique doc_ids so far: {len(doc_ids)}"
+                    )
+                
+            finally:
+                # Always close iterator to free resources
+                if iterator:
+                    try:
+                        iterator.close()
+                    except Exception as close_error:
+                        logger.warning(
+                            f"[{self.workspace}] Failed to close query iterator: {close_error}"
+                        )
+            
+            # Convert set to list for return
+            result_list = list(doc_ids)
+            logger.info(
+                f"[{self.workspace}] Found {len(result_list)} unique documents with file_url='{file_url}'"
+            )
+            return result_list
+            
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error querying doc_ids by file_url '{file_url}': {e}"
+            )
+            return []
+
     async def drop(self) -> dict[str, str]:
         """Drop all vector data from storage and clean up resources
 
