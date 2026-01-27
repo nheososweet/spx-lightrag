@@ -597,6 +597,94 @@ class DeleteByTableNameRequest(BaseModel):
         }
 
 
+class DeleteByFileIdRequest(BaseModel):
+    """Request model for deleting documents by file_id
+
+    Attributes:
+        file_id: The file_id value to filter by (from Milvus dynamic fields)
+        delete_file: Whether to delete the corresponding files in the upload directory
+        delete_llm_cache: Whether to delete cached LLM extraction results
+        run_in_background: Whether to run deletion in background (True) or wait for completion (False)
+    """
+
+    file_id: str = Field(
+        ...,
+        min_length=1,
+        description="The file_id value to filter by. All documents with chunks matching this file_id will be deleted.",
+    )
+    delete_file: bool = Field(
+        default=False,
+        description="Whether to delete the corresponding files in the upload directory.",
+    )
+    delete_llm_cache: bool = Field(
+        default=False,
+        description="Whether to delete cached LLM extraction results for the documents.",
+    )
+    run_in_background: bool = Field(
+        default=True,
+        description="Whether to run deletion in background (True) or wait for completion (False). Set to False if calling from external worker system.",
+    )
+
+    @field_validator("file_id", mode="after")
+    @classmethod
+    def validate_file_id(cls, file_id: str) -> str:
+        if not file_id or not file_id.strip():
+            raise ValueError("file_id cannot be empty")
+        return file_id.strip()
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "file_id": "cab4fa00-e0bb-41bb-8b2b-45a5c46041d2",
+                "delete_file": False,
+                "delete_llm_cache": True,
+                "run_in_background": True,
+            }
+        }
+
+
+class DeleteByFileIdResponse(BaseModel):
+    """Response model for delete by file_id operation
+
+    Attributes:
+        status: Status of the deletion operation
+        file_id: The file_id that was targeted for deletion
+        total_docs: Total number of documents found with this file_id
+        deleted_docs: List of successfully deleted document IDs
+        failed_docs: List of document IDs that failed to delete (with error messages)
+        message: Summary message describing the operation result
+    """
+
+    status: Literal[
+        "deletion_started", "success", "partial_success", "not_found", "busy", "failure"
+    ] = Field(description="Status of the deletion operation")
+    file_id: str = Field(description="The file_id that was targeted for deletion")
+    total_docs: int = Field(
+        description="Total number of documents found with this file_id"
+    )
+    deleted_docs: List[str] = Field(
+        default_factory=list,
+        description="List of successfully deleted document IDs",
+    )
+    failed_docs: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="List of document IDs that failed to delete (with error messages)",
+    )
+    message: str = Field(description="Summary message describing the operation result")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "status": "success",
+                "file_id": "cab4fa00-e0bb-41bb-8b2b-45a5c46041d2",
+                "total_docs": 1,
+                "deleted_docs": ["doc_001"],
+                "failed_docs": [],
+                "message": "Successfully deleted all 1 document(s) with file_id='cab4fa00-e0bb-41bb-8b2b-45a5c46041d2'",
+            }
+        }
+
+
 class DeleteByTableNameResponse(BaseModel):
     """Response model for delete by table_name operation
 
@@ -2730,6 +2818,56 @@ async def background_delete_by_table_name(
         logger.error(traceback.format_exc())
 
 
+async def background_delete_by_file_id(
+    rag: LightRAG,
+    doc_manager: DocumentManager,
+    file_id: str,
+    delete_file: bool = False,
+    delete_llm_cache: bool = False,
+):
+    """Background task to delete all documents with a specific file_id.
+
+    This function queries the chunks_vdb to find all documents that have chunks
+    with the specified file_id, then deletes each document using adelete_by_file_id.
+
+    Args:
+        rag: LightRAG instance
+        doc_manager: DocumentManager instance (kept for consistency with other background tasks)
+        file_id: The file_id value to filter by (from Milvus dynamic fields)
+        delete_file: Whether to delete the physical file from storage
+        delete_llm_cache: Whether to delete cached LLM extraction results
+    """
+    try:
+        logger.info(f"[DELETE BY FILE ID BG] Starting background deletion for file_id='{file_id}'")
+
+        # Call the LightRAG method that handles all the deletion logic
+        result = await rag.adelete_by_file_id(
+            file_id=file_id,
+            delete_file=delete_file,
+            delete_llm_cache=delete_llm_cache,
+        )
+
+        if result["status"] == "success":
+            logger.info(
+                f"[DELETE BY FILE ID BG] Successfully deleted {len(result['deleted_docs'])} documents "
+                f"with file_id='{file_id}'"
+            )
+        elif result["status"] == "partial_success":
+            logger.warning(
+                f"[DELETE BY FILE ID BG] Partial deletion for file_id='{file_id}': "
+                f"{len(result['deleted_docs'])} succeeded, {len(result['failed_docs'])} failed"
+            )
+        elif result["status"] == "not_found":
+            logger.info(f"[DELETE BY FILE ID BG] No documents found with file_id='{file_id}'")
+        else:
+            logger.error(f"[DELETE BY FILE ID BG] Deletion failed: {result['message']}")
+
+    except Exception as e:
+        error_msg = f"[DELETE BY FILE ID BG] Critical error during deletion for file_id='{file_id}': {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
+
+
 def create_document_routes(
     rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
 ):
@@ -3845,6 +3983,122 @@ def create_document_routes(
 
         except Exception as e:
             error_msg = f"Error initiating document deletion for table_name='{table_name}': {str(e)}"
+            logger.error(error_msg)
+            logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    @router.delete(
+        "/delete_by_file_id",
+        response_model=DeleteByFileIdResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Delete all documents with a specific file_id in Milvus dynamic fields.",
+    )
+    async def delete_by_file_id(
+        delete_request: DeleteByFileIdRequest,
+        background_tasks: BackgroundTasks,
+    ) -> DeleteByFileIdResponse:
+        """
+        Delete all documents that have chunks with a specific file_id in Milvus dynamic fields.
+
+        This endpoint queries the chunks vector database to find all documents (full_doc_id)
+        that have chunks with the specified file_id, then deletes each document
+        along with all its associated data including chunks, vector embeddings, and graph data.
+
+        **Requirements**:
+        - Milvus storage must be configured for chunks_vdb
+        - Documents must have been uploaded with file_id metadata (via /upload_from_url endpoint)
+
+        **Deletion Process**:
+        1. Query Milvus chunks collection to find all full_doc_ids with matching file_id
+        2. For each found document, perform complete deletion (same as /delete_document)
+        3. Delete: doc_status, full_docs, text_chunks, chunks_vdb, entities_vdb, relationships_vdb, graph data
+
+        The deletion can run either synchronously (wait for completion) or in the background.
+        Use the pipeline status endpoint to monitor background progress.
+
+        Args:
+            delete_request (DeleteByFileIdRequest): Request containing file_id and deletion options.
+            background_tasks: FastAPI BackgroundTasks for async processing
+
+        Returns:
+            DeleteByFileIdResponse: The result of the deletion operation.
+                - status="success": Deletion completed successfully (synchronous mode).
+                - status="deletion_started": Deletion has been initiated in the background.
+                - status="not_found": No documents found with the specified file_id.
+                - status="busy": Pipeline is busy with another operation.
+                - status="failure": An error occurred during deletion.
+
+        Raises:
+            HTTPException:
+              - 500: If an unexpected internal error occurs during initialization.
+        """
+        file_id = delete_request.file_id
+
+        try:
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=rag.workspace
+            )
+
+            # Check if pipeline is busy with proper lock
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                    return DeleteByFileIdResponse(
+                        status="busy",
+                        file_id=file_id,
+                        total_docs=0,
+                        deleted_docs=[],
+                        failed_docs=[],
+                        message="Cannot delete documents while pipeline is busy",
+                    )
+
+            # Check if should run in background or synchronously
+            if delete_request.run_in_background:
+                # Run in background
+                background_tasks.add_task(
+                    background_delete_by_file_id,
+                    rag,
+                    doc_manager,
+                    file_id,
+                    delete_request.delete_file,
+                    delete_request.delete_llm_cache,
+                )
+
+                return DeleteByFileIdResponse(
+                    status="deletion_started",
+                    file_id=file_id,
+                    total_docs=0,  # Will be determined during background processing
+                    deleted_docs=[],
+                    failed_docs=[],
+                    message=f"Document deletion for file_id='{file_id}' has been initiated. Processing will continue in background. Use /pipeline_status to monitor progress.",
+                )
+            else:
+                # Run synchronously and wait for completion
+                logger.info(f"Running synchronous deletion for file_id='{file_id}'")
+                result = await rag.adelete_by_file_id(
+                    file_id,
+                    delete_file=delete_request.delete_file,
+                    delete_llm_cache=delete_request.delete_llm_cache,
+                )
+
+                return DeleteByFileIdResponse(
+                    status=result["status"],
+                    file_id=result["file_id"],
+                    total_docs=result["total_docs"],
+                    deleted_docs=result["deleted_docs"],
+                    failed_docs=result["failed_docs"],
+                    message=result["message"],
+                )
+
+        except Exception as e:
+            error_msg = f"Error initiating document deletion for file_id='{file_id}': {str(e)}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=error_msg)
