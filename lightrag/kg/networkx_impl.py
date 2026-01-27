@@ -95,38 +95,53 @@ class NetworkXStorage(BaseGraphStorage):
 
             return self._graph
 
+    def _get_query_graph(self, graph: nx.Graph) -> nx.Graph:
+        """Get a view of the graph that filters out soft-deleted nodes and edges"""
+        return nx.subgraph_view(
+            graph,
+            filter_node=lambda n: not graph.nodes[n].get("isDeleted", False),
+            filter_edge=lambda u, v: not graph[u][v].get("isDeleted", False),
+        )
+
     async def has_node(self, node_id: str) -> bool:
         graph = await self._get_graph()
-        return graph.has_node(node_id)
+        query_graph = self._get_query_graph(graph)
+        return query_graph.has_node(node_id)
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         graph = await self._get_graph()
-        return graph.has_edge(source_node_id, target_node_id)
+        query_graph = self._get_query_graph(graph)
+        return query_graph.has_edge(source_node_id, target_node_id)
 
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         graph = await self._get_graph()
-        return graph.nodes.get(node_id)
+        query_graph = self._get_query_graph(graph)
+        return query_graph.nodes.get(node_id)
 
     async def node_degree(self, node_id: str) -> int:
         graph = await self._get_graph()
-        return graph.degree(node_id)
+        query_graph = self._get_query_graph(graph)
+        return query_graph.degree(node_id)
 
     async def edge_degree(self, src_id: str, tgt_id: str) -> int:
         graph = await self._get_graph()
-        src_degree = graph.degree(src_id) if graph.has_node(src_id) else 0
-        tgt_degree = graph.degree(tgt_id) if graph.has_node(tgt_id) else 0
+        query_graph = self._get_query_graph(graph)
+        src_degree = query_graph.degree(src_id) if query_graph.has_node(src_id) else 0
+        tgt_degree = query_graph.degree(tgt_id) if query_graph.has_node(tgt_id) else 0
         return src_degree + tgt_degree
 
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> dict[str, str] | None:
         graph = await self._get_graph()
-        return graph.edges.get((source_node_id, target_node_id))
+        query_graph = self._get_query_graph(graph)
+        return query_graph.edges.get((source_node_id, target_node_id))
 
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         graph = await self._get_graph()
-        if graph.has_node(source_node_id):
-            return list(graph.edges(source_node_id))
+        query_graph = self._get_query_graph(graph)
+        if query_graph.has_node(source_node_id):
+            return list(query_graph.edges(source_node_id))
         return None
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
@@ -137,6 +152,8 @@ class NetworkXStorage(BaseGraphStorage):
            KG-storage-log should be used to avoid data corruption
         """
         graph = await self._get_graph()
+        if "isDeleted" not in node_data:
+            node_data["isDeleted"] = False
         graph.add_node(node_id, **node_data)
 
     async def upsert_edge(
@@ -149,22 +166,44 @@ class NetworkXStorage(BaseGraphStorage):
            KG-storage-log should be used to avoid data corruption
         """
         graph = await self._get_graph()
+        if "isDeleted" not in edge_data:
+            edge_data["isDeleted"] = False
         graph.add_edge(source_node_id, target_node_id, **edge_data)
 
     async def delete_node(self, node_id: str) -> None:
-        """
-        Importance notes:
-        1. Changes will be persisted to disk during the next index_done_callback
-        2. Only one process should updating the storage at a time before index_done_callback,
-           KG-storage-log should be used to avoid data corruption
-        """
+        """Delete a node from the graph."""
         graph = await self._get_graph()
         if graph.has_node(node_id):
             graph.remove_node(node_id)
+            await set_all_update_flags(self.namespace, workspace=self.workspace)
             logger.debug(f"[{self.workspace}] Node {node_id} deleted from the graph")
         else:
             logger.warning(
                 f"[{self.workspace}] Node {node_id} not found in the graph for deletion"
+            )
+
+    async def soft_delete_node(self, node_id: str, is_deleted: bool = True) -> None:
+        """Mark a node as deleted or active."""
+        graph = await self._get_graph()
+        if graph.has_node(node_id):
+            graph.nodes[node_id]["isDeleted"] = is_deleted
+            await set_all_update_flags(self.namespace, workspace=self.workspace)
+            logger.debug(f"[{self.workspace}] Node {node_id} soft-updated isDeleted={is_deleted} in graph")
+        else:
+            logger.warning(
+                f"[{self.workspace}] Node {node_id} not found in the graph for soft-update"
+            )
+
+    async def soft_delete_edge(self, source_node_id: str, target_node_id: str, is_deleted: bool = True) -> None:
+        """Mark specific edge as deleted or active."""
+        graph = await self._get_graph()
+        if graph.has_edge(source_node_id, target_node_id):
+            graph[source_node_id][target_node_id]["isDeleted"] = is_deleted
+            await set_all_update_flags(self.namespace, workspace=self.workspace)
+            logger.debug(f"[{self.workspace}] Edge {source_node_id}-{target_node_id} soft-updated isDeleted={is_deleted} in graph")
+        else:
+            logger.warning(
+                f"[{self.workspace}] Edge {source_node_id}-{target_node_id} not found in the graph for soft-update"
             )
 
     async def remove_nodes(self, nodes: list[str]):
@@ -182,7 +221,21 @@ class NetworkXStorage(BaseGraphStorage):
         for node in nodes:
             if graph.has_node(node):
                 graph.remove_node(node)
+        await set_all_update_flags(self.namespace, workspace=self.workspace)
 
+    async def soft_remove_nodes(self, nodes: list[str], is_deleted: bool = True):
+        """Soft delete multiple nodes
+
+        Args:
+            nodes: List of node IDs to be soft-deleted
+            is_deleted: True to mark as deleted, False to reactivate
+        """
+        graph = await self._get_graph()
+        for node in nodes:
+            if graph.has_node(node):
+                graph.nodes[node]["isDeleted"] = is_deleted
+        await set_all_update_flags(self.namespace, workspace=self.workspace)
+    
     async def remove_edges(self, edges: list[tuple[str, str]]):
         """Delete multiple edges
 
@@ -191,13 +244,19 @@ class NetworkXStorage(BaseGraphStorage):
         2. Only one process should updating the storage at a time before index_done_callback,
            KG-storage-log should be used to avoid data corruption
 
-        Args:
-            edges: List of edges to be deleted, each edge is a (source, target) tuple
-        """
         graph = await self._get_graph()
         for source, target in edges:
             if graph.has_edge(source, target):
                 graph.remove_edge(source, target)
+        await set_all_update_flags(self.namespace, workspace=self.workspace)
+
+    async def soft_remove_edges(self, edges: list[tuple[str, str]], is_deleted: bool = True):
+        """Soft delete multiple edges"""
+        graph = await self._get_graph()
+        for source, target in edges:
+            if graph.has_edge(source, target):
+                graph[source][target]["isDeleted"] = is_deleted
+        await set_all_update_flags(self.namespace, workspace=self.workspace)
 
     async def get_all_labels(self) -> list[str]:
         """
@@ -205,9 +264,11 @@ class NetworkXStorage(BaseGraphStorage):
         Returns:
             [label1, label2, ...]  # Alphabetically sorted label list
         """
+        """
         graph = await self._get_graph()
+        query_graph = self._get_query_graph(graph)
         labels = set()
-        for node in graph.nodes():
+        for node in query_graph.nodes():
             labels.add(str(node))  # Add node id as a label
 
         # Return sorted list
@@ -223,10 +284,12 @@ class NetworkXStorage(BaseGraphStorage):
         Returns:
             List of labels sorted by degree (highest first)
         """
+        """
         graph = await self._get_graph()
+        query_graph = self._get_query_graph(graph)
 
         # Get degrees of all nodes and sort by degree descending
-        degrees = dict(graph.degree())
+        degrees = dict(query_graph.degree())
         sorted_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
 
         # Return top labels limited by the specified limit
@@ -249,7 +312,9 @@ class NetworkXStorage(BaseGraphStorage):
         Returns:
             List of matching labels sorted by relevance
         """
+        """
         graph = await self._get_graph()
+        query_graph = self._get_query_graph(graph)
         query_lower = query.lower().strip()
 
         if not query_lower:
@@ -257,7 +322,7 @@ class NetworkXStorage(BaseGraphStorage):
 
         # Collect matching nodes with relevance scores
         matches = []
-        for node in graph.nodes():
+        for node in query_graph.nodes():
             node_str = str(node)
             node_lower = node_str.lower()
 
@@ -319,14 +384,17 @@ class NetworkXStorage(BaseGraphStorage):
             # Limit max_nodes to not exceed global_config max_graph_nodes
             max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
 
+            max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
+
         graph = await self._get_graph()
+        query_graph = self._get_query_graph(graph)
 
         result = KnowledgeGraph()
 
         # Handle special case for "*" label
         if node_label == "*":
             # Get degrees of all nodes
-            degrees = dict(graph.degree())
+            degrees = dict(query_graph.degree())
             # Sort nodes by degree in descending order and take top max_nodes
             sorted_nodes = sorted(degrees.items(), key=lambda x: x[1], reverse=True)
 
@@ -339,10 +407,10 @@ class NetworkXStorage(BaseGraphStorage):
 
             limited_nodes = [node for node, _ in sorted_nodes[:max_nodes]]
             # Create subgraph with the highest degree nodes
-            subgraph = graph.subgraph(limited_nodes)
+            subgraph = query_graph.subgraph(limited_nodes)
         else:
             # Check if node exists
-            if node_label not in graph:
+            if node_label not in query_graph:
                 logger.warning(
                     f"[{self.workspace}] Node {node_label} not found in the graph"
                 )
@@ -352,7 +420,7 @@ class NetworkXStorage(BaseGraphStorage):
             bfs_nodes = []
             visited = set()
             # Store (node, depth, degree) in the queue
-            queue = [(node_label, 0, graph.degree(node_label))]
+            queue = [(node_label, 0, query_graph.degree(node_label))]
 
             # Flag to track if there are unexplored neighbors due to depth limit
             has_unexplored_neighbors = False
@@ -379,29 +447,8 @@ class NetworkXStorage(BaseGraphStorage):
                         # Only explore neighbors if we haven't reached max_depth
                         if depth < max_depth:
                             # Add neighbor nodes to queue with incremented depth
-                            neighbors = list(graph.neighbors(current_node))
+                            neighbors = list(query_graph.neighbors(current_node))
                             # Filter out already visited neighbors
-                            unvisited_neighbors = [
-                                n for n in neighbors if n not in visited
-                            ]
-                            # Add neighbors to the queue with their degrees
-                            for neighbor in unvisited_neighbors:
-                                neighbor_degree = graph.degree(neighbor)
-                                queue.append((neighbor, depth + 1, neighbor_degree))
-                        else:
-                            # Check if there are unexplored neighbors (skipped due to depth limit)
-                            neighbors = list(graph.neighbors(current_node))
-                            unvisited_neighbors = [
-                                n for n in neighbors if n not in visited
-                            ]
-                            if unvisited_neighbors:
-                                has_unexplored_neighbors = True
-
-                    # Check if we've reached max_nodes
-                    if len(bfs_nodes) >= max_nodes:
-                        break
-
-            # Check if graph is truncated - either due to max_nodes limit or depth limit
             if (queue and len(bfs_nodes) >= max_nodes) or has_unexplored_neighbors:
                 if len(bfs_nodes) >= max_nodes:
                     result.is_truncated = True
@@ -414,7 +461,7 @@ class NetworkXStorage(BaseGraphStorage):
                     )
 
             # Create subgraph with BFS discovered nodes
-            subgraph = graph.subgraph(bfs_nodes)
+            subgraph = query_graph.subgraph(bfs_nodes)
 
         # Add nodes to result
         seen_nodes = set()
@@ -477,9 +524,11 @@ class NetworkXStorage(BaseGraphStorage):
         Returns:
             A list of all nodes, where each node is a dictionary of its properties
         """
+        """
         graph = await self._get_graph()
+        query_graph = self._get_query_graph(graph)
         all_nodes = []
-        for node_id, node_data in graph.nodes(data=True):
+        for node_id, node_data in query_graph.nodes(data=True):
             node_data_with_id = node_data.copy()
             node_data_with_id["id"] = node_id
             all_nodes.append(node_data_with_id)
@@ -491,14 +540,44 @@ class NetworkXStorage(BaseGraphStorage):
         Returns:
             A list of all edges, where each edge is a dictionary of its properties
         """
+        """
         graph = await self._get_graph()
+        query_graph = self._get_query_graph(graph)
         all_edges = []
-        for u, v, edge_data in graph.edges(data=True):
+        for u, v, edge_data in query_graph.edges(data=True):
             edge_data_with_nodes = edge_data.copy()
             edge_data_with_nodes["source"] = u
             edge_data_with_nodes["target"] = v
             all_edges.append(edge_data_with_nodes)
         return all_edges
+
+    async def soft_delete(self, ids: list[str], is_deleted: bool = True) -> None:
+        """Mark specific records as deleted or active."""
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("NetworkXStorage")
+
+        import time
+        current_time = int(time.time())
+
+        async with self._storage_lock:
+            any_updated = False
+            for node_id in ids:
+                if self._graph.has_node(node_id):
+                    self._graph.nodes[node_id]["isDeleted"] = is_deleted
+                    self._graph.nodes[node_id]["update_time"] = current_time
+                    any_updated = True
+            
+            # Also check edges
+            for u, v, data in self._graph.edges(data=True):
+                edge_id = data.get("id") # Assuming edges might have an 'id' property
+                if edge_id in ids:
+                    self._graph.edges[u, v]["isDeleted"] = is_deleted
+                    self._graph.edges[u, v]["update_time"] = current_time
+                    any_updated = True
+
+            if any_updated:
+                await set_all_update_flags(self.namespace, workspace=self.workspace)
+                self.storage_updated.value = False # Reset own update flag to avoid self-reloading
 
     async def index_done_callback(self) -> bool:
         """Save data to disk"""

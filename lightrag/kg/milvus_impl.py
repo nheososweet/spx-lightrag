@@ -35,6 +35,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             ),
             FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=dimension),
             FieldSchema(name="created_at", dtype=DataType.INT64),
+            FieldSchema(name="isDeleted", dtype=DataType.BOOL),
         ]
 
         # Determine specific fields based on namespace
@@ -320,6 +321,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             "id": {"type": "VarChar", "is_primary": True},
             "vector": {"type": "FloatVector"},
             "created_at": {"type": "Int64"},
+            "isDeleted": {"type": "Bool"},
         }
 
         # Add specific fields based on namespace
@@ -976,6 +978,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         # Ensure created_at is in meta_fields
         if "created_at" not in self.meta_fields:
             self.meta_fields.add("created_at")
+        if "isDeleted" not in self.meta_fields:
+            self.meta_fields.add("isDeleted")
 
         # Add custom metadata fields for chunks namespace to support Dynamic Fields
         if self.namespace.endswith("chunks"):
@@ -1066,6 +1070,11 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             }
             for k, v in data.items()
         ]
+        # Ensure isDeleted is set to False by default if not present
+        for d in list_data:
+            if "isDeleted" not in d:
+                d["isDeleted"] = False
+
         contents = [v["content"] for v in data.values()]
         batches = [
             contents[i : i + self._max_batch_size]
@@ -1089,6 +1098,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
         top_k: int,
         query_embedding: list[float] = None,
         filter: str | None = None,
+        include_deleted: bool = False,
     ) -> list[dict[str, Any]]:
         # Ensure collection is loaded before querying
         self._ensure_collection_loaded()
@@ -1109,6 +1119,10 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             "metric_type": "COSINE",
             "params": {"radius": self.cosine_better_than_threshold},
         }
+
+        # Execute search
+        if not include_deleted:
+            filter = f"({filter}) and isDeleted == False" if filter else "isDeleted == False"
 
         # Execute search
         results = self._client.search(
@@ -1235,7 +1249,51 @@ class MilvusVectorDBStorage(BaseVectorStorage):
                 f"[{self.workspace}] Error while deleting vectors from {self.namespace}: {e}"
             )
 
-    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+    async def soft_delete(self, ids: list[str], is_deleted: bool = True) -> None:
+        """Mark vectors with specified IDs as deleted or active."""
+        try:
+            self._ensure_collection_loaded()
+            
+            if not ids:
+                return
+
+            # Fetch existing data including vector
+            # We need vector to re-upsert because upsert replaces the entity
+            output_fields = list(self.meta_fields) + ["id", "vector"]
+            
+            id_list = '", "'.join(ids)
+            # Fetch even if already deleted, to update them if needed (idempotent)
+            filter_expr = f'id in ["{id_list}"]'
+            
+            results = self._client.query(
+                collection_name=self.final_namespace,
+                filter=filter_expr,
+                output_fields=output_fields,
+            )
+            
+            if not results:
+                return
+
+            # Modify isDeleted and prepare for upsert
+            for item in results:
+                item["isDeleted"] = is_deleted
+            
+            # Upsert back
+            res = self._client.upsert(
+                collection_name=self.final_namespace,
+                data=results
+            )
+            
+            logger.debug(
+                f"[{self.workspace}] Soft updated isDeleted={is_deleted} for {res.get('upsert_count', 0)} vectors in {self.namespace}"
+            )
+
+        except Exception as e:
+            logger.error(
+                f"[{self.workspace}] Error in soft_delete for {self.namespace}: {e}"
+            )
+
+    async def get_by_id(self, id: str, include_deleted: bool = False) -> dict[str, Any] | None:
         """Get vector data by its ID
 
         Args:
@@ -1252,9 +1310,13 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             output_fields = list(self.meta_fields) + ["id"]
 
             # Query Milvus for a specific ID
+            filter_expr = f'id == "{id}"'
+            if not include_deleted:
+                filter_expr += ' and isDeleted == False'
+            
             result = self._client.query(
                 collection_name=self.final_namespace,
-                filter=f'id == "{id}"',
+                filter=filter_expr,
                 output_fields=output_fields,
             )
 
@@ -1268,7 +1330,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return None
 
-    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+    async def get_by_ids(self, ids: list[str], include_deleted: bool = False) -> list[dict[str, Any]]:
         """Get multiple vector data by their IDs
 
         Args:
@@ -1290,6 +1352,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Prepare the ID filter expression
             id_list = '", "'.join(ids)
             filter_expr = f'id in ["{id_list}"]'
+            if not include_deleted:
+                filter_expr += ' and isDeleted == False'
 
             # Query Milvus with the filter
             result = self._client.query(
@@ -1320,7 +1384,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return []
 
-    async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
+    async def get_vectors_by_ids(self, ids: list[str], include_deleted: bool = False) -> dict[str, list[float]]:
         """Get vectors by their IDs, returning only ID and vector data for efficiency
 
         Args:
@@ -1340,6 +1404,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Prepare the ID filter expression
             id_list = '", "'.join(ids)
             filter_expr = f'id in ["{id_list}"]'
+            if not include_deleted:
+                filter_expr += ' and isDeleted == False'
 
             # Query Milvus with the filter, requesting only vector field
             result = self._client.query(
@@ -1364,7 +1430,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return {}
 
-    async def get_doc_ids_by_table_name(self, table_name: str) -> list[str]:
+    async def get_doc_ids_by_table_name(self, table_name: str, include_deleted: bool = False) -> list[str]:
         """Get unique full_doc_ids by filtering on table_name in dynamic fields.
         
         This method queries the chunks collection to find all documents (full_doc_id)
@@ -1390,6 +1456,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             
             # Build filter expression for table_name
             filter_expr = f'table_name == "{table_name}"'
+            if not include_deleted:
+                filter_expr += ' and isDeleted == False'
             logger.info(
                 f"[{self.workspace}] Querying chunks with table_name='{table_name}'"
             )
@@ -1443,7 +1511,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return []
 
-    async def get_doc_ids_by_file_id(self, file_id: str) -> list[str]:
+    async def get_doc_ids_by_file_id(self, file_id: str, include_deleted: bool = False) -> list[str]:
         """Get unique full_doc_ids by filtering on file_id in dynamic fields.
         
         This method queries the chunks collection to find all documents (full_doc_id)
@@ -1479,6 +1547,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             
             # Build filter expression for file_id (exact match in dynamic fields)
             filter_expr = f'file_id == "{file_id}"'
+            if not include_deleted:
+                filter_expr += ' and isDeleted == False'
             logger.info(
                 f"[{self.workspace}] Querying chunks with file_id='{file_id}'"
             )
@@ -1537,7 +1607,7 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             )
             return []
 
-    async def get_doc_ids_by_file_url(self, file_url: str) -> list[str]:
+    async def get_doc_ids_by_file_url(self, file_url: str, include_deleted: bool = False) -> list[str]:
         """Get unique full_doc_ids by filtering on file_url in dynamic fields.
         
         This method queries the chunks collection to find all documents (full_doc_id)
@@ -1574,6 +1644,8 @@ class MilvusVectorDBStorage(BaseVectorStorage):
             # Build filter expression for file_url (exact match in dynamic fields)
             # Note: file_url may contain special characters, use proper escaping
             filter_expr = f'file_url == "{file_url}"'
+            if not include_deleted:
+                filter_expr += ' and isDeleted == False'
             logger.info(
                 f"[{self.workspace}] Querying chunks with file_url='{file_url}'"
             )

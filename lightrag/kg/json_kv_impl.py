@@ -103,10 +103,13 @@ class JsonKVStorage(BaseKVStorage):
 
                 await clear_all_update_flags(self.namespace, workspace=self.workspace)
 
-    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+    async def get_by_id(self, id: str, include_deleted: bool = False) -> dict[str, Any] | None:
         async with self._storage_lock:
             result = self._data.get(id)
             if result:
+                # Check soft delete
+                if not include_deleted and result.get("isDeleted", False):
+                    return None
                 # Create a copy to avoid modifying the original data
                 result = dict(result)
                 # Ensure time fields are present, provide default values for old data
@@ -116,12 +119,17 @@ class JsonKVStorage(BaseKVStorage):
                 result["_id"] = id
             return result
 
-    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+    async def get_by_ids(self, ids: list[str], include_deleted: bool = False) -> list[dict[str, Any]]:
+        ordered_results: list[dict[str, Any] | None] = []
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("JsonKVStorage")
         async with self._storage_lock:
-            results = []
             for id in ids:
                 data = self._data.get(id, None)
                 if data:
+                    if not include_deleted and data.get("isDeleted", False):
+                        ordered_results.append(None)
+                        continue
                     # Create a copy to avoid modifying the original data
                     result = {k: v for k, v in data.items()}
                     # Ensure time fields are present, provide default values for old data
@@ -129,7 +137,7 @@ class JsonKVStorage(BaseKVStorage):
                     result.setdefault("update_time", 0)
                     # Ensure _id field contains the clean ID
                     result["_id"] = id
-                    results.append(result)
+                    ordered_results.append(result)
                 else:
                     results.append(None)
             return results
@@ -167,9 +175,15 @@ class JsonKVStorage(BaseKVStorage):
                 # Add timestamps based on whether key exists
                 if k in self._data:  # Key exists, only update update_time
                     v["update_time"] = current_time
+                    # Preserve isDeleted if not present in input
+                    if "isDeleted" not in v:
+                        v["isDeleted"] = self._data[k].get("isDeleted", False)
                 else:  # New key, set both create_time and update_time
                     v["create_time"] = current_time
                     v["update_time"] = current_time
+                    # Default isDeleted to False for new records
+                    if "isDeleted" not in v:
+                        v["isDeleted"] = False
 
                 v["_id"] = k
 
@@ -197,6 +211,25 @@ class JsonKVStorage(BaseKVStorage):
                     any_deleted = True
 
             if any_deleted:
+                await set_all_update_flags(self.namespace, workspace=self.workspace)
+
+    async def soft_delete(self, ids: list[str], is_deleted: bool = True) -> None:
+        """Mark specific records as deleted or active."""
+        if self._storage_lock is None:
+            raise StorageNotInitializedError("JsonKVStorage")
+        
+        import time
+        current_time = int(time.time())
+
+        async with self._storage_lock:
+            any_updated = False
+            for doc_id in ids:
+                if doc_id in self._data:
+                    self._data[doc_id]["isDeleted"] = is_deleted
+                    self._data[doc_id]["update_time"] = current_time
+                    any_updated = True
+            
+            if any_updated:
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
 
     async def is_empty(self) -> bool:

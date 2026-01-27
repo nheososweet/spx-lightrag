@@ -77,7 +77,7 @@ class JsonDocStatusStorage(DocStatusStorage):
         async with self._storage_lock:
             return set(keys) - set(self._data.keys())
 
-    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+    async def get_by_ids(self, ids: list[str], include_deleted: bool = False) -> list[dict[str, Any]]:
         ordered_results: list[dict[str, Any] | None] = []
         if self._storage_lock is None:
             raise StorageNotInitializedError("JsonDocStatusStorage")
@@ -85,7 +85,10 @@ class JsonDocStatusStorage(DocStatusStorage):
             for id in ids:
                 data = self._data.get(id, None)
                 if data:
-                    ordered_results.append(data.copy())
+                    if not include_deleted and data.get("isDeleted", False):
+                        ordered_results.append(None)
+                    else:
+                        ordered_results.append(data.copy())
                 else:
                     ordered_results.append(None)
         return ordered_results
@@ -107,6 +110,8 @@ class JsonDocStatusStorage(DocStatusStorage):
         result = {}
         async with self._storage_lock:
             for k, v in self._data.items():
+                if v.get("isDeleted", False):
+                    continue
                 if v["status"] == status.value:
                     try:
                         # Make a copy of the data to avoid modifying the original
@@ -136,6 +141,8 @@ class JsonDocStatusStorage(DocStatusStorage):
         result = {}
         async with self._storage_lock:
             for k, v in self._data.items():
+                if v.get("isDeleted", False):
+                    continue
                 if v.get("track_id") == track_id:
                     try:
                         # Make a copy of the data to avoid modifying the original
@@ -201,6 +208,13 @@ class JsonDocStatusStorage(DocStatusStorage):
             for doc_id, doc_data in data.items():
                 if "chunks_list" not in doc_data:
                     doc_data["chunks_list"] = []
+                # Ensure isDeleted
+                if "isDeleted" not in doc_data:
+                    # If updating existing, preserve; if new, Default False
+                    if doc_id in self._data:
+                        doc_data["isDeleted"] = self._data[doc_id].get("isDeleted", False)
+                    else:
+                        doc_data["isDeleted"] = False
             self._data.update(data)
             await set_all_update_flags(self.namespace, workspace=self.workspace)
 
@@ -263,6 +277,9 @@ class JsonDocStatusStorage(DocStatusStorage):
 
         async with self._storage_lock:
             for doc_id, doc_data in self._data.items():
+                if doc_data.get("isDeleted", False):
+                    continue
+
                 # Apply status filter
                 if (
                     status_filter is not None
@@ -280,6 +297,8 @@ class JsonDocStatusStorage(DocStatusStorage):
                         data["metadata"] = {}
                     if "error_msg" not in data:
                         data["error_msg"] = None
+                    if "isDeleted" not in data:
+                        data["isDeleted"] = False
 
                     doc_status = DocProcessingStatus(**data)
 
@@ -358,11 +377,24 @@ class JsonDocStatusStorage(DocStatusStorage):
             if any_deleted:
                 await set_all_update_flags(self.namespace, workspace=self.workspace)
 
-    async def get_doc_by_file_path(self, file_path: str) -> Union[dict[str, Any], None]:
+    async def soft_delete(self, doc_ids: list[str], is_deleted: bool = True) -> None:
+        """Mark specific records as deleted or active."""
+        async with self._storage_lock:
+            any_updated = False
+            for doc_id in doc_ids:
+                if doc_id in self._data:
+                    self._data[doc_id]["isDeleted"] = is_deleted
+                    any_updated = True
+            
+            if any_updated:
+                await set_all_update_flags(self.namespace, workspace=self.workspace)
+
+    async def get_doc_by_file_path(self, file_path: str, include_deleted: bool = False) -> Union[dict[str, Any], None]:
         """Get document by file path
 
         Args:
             file_path: The file path to search for
+            include_deleted: Whether to include soft-deleted documents
 
         Returns:
             Union[dict[str, Any], None]: Document data if found, None otherwise
@@ -374,8 +406,12 @@ class JsonDocStatusStorage(DocStatusStorage):
         async with self._storage_lock:
             for doc_id, doc_data in self._data.items():
                 if doc_data.get("file_path") == file_path:
+                    if not include_deleted and doc_data.get("isDeleted", False):
+                        continue
                     # Return complete document data, consistent with get_by_ids method
-                    return doc_data
+                    data = doc_data.copy()
+                    data["id"] = doc_id
+                    return data
 
         return None
 

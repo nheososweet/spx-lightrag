@@ -2962,8 +2962,21 @@ def create_document_routes(
                 )
 
             # Check if filename already exists in doc_status storage
-            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename)
+            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename, include_deleted=True)
             if existing_doc_data:
+                # Check if it's soft-deleted
+                if existing_doc_data.get("isDeleted", False):
+                    # Reactivate instead of re-ingesting
+                    doc_id = existing_doc_data.get("id")
+                    if doc_id:
+                        logger.info(f"[UPLOAD] Found soft-deleted file '{safe_filename}' (doc_id: {doc_id}). Reactivating...")
+                        await rag.aactive_by_doc_id(doc_id)
+                        return InsertResponse(
+                            status="success",
+                            message=f"File '{safe_filename}' was previously deleted and has been restored.",
+                            track_id=existing_doc_data.get("track_id") or "",
+                        )
+
                 # Get document status and track_id from existing document
                 status = existing_doc_data.get("status", "unknown")
                 # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
@@ -3082,8 +3095,21 @@ def create_document_routes(
             # Check if filename already exists in doc_status storage
             logger.info(f"[UPLOAD FROM URL] Step 4/6: Checking for duplicates")
             logger.debug(f"[UPLOAD FROM URL] Checking doc_status storage...")
-            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename)
+            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename, include_deleted=True)
             if existing_doc_data:
+                # Check if it's soft-deleted
+                if existing_doc_data.get("isDeleted", False):
+                    # Reactivate instead of re-ingesting
+                    doc_id = existing_doc_data.get("id")
+                    if doc_id:
+                        logger.info(f"[UPLOAD FROM URL] Found soft-deleted file '{safe_filename}' (doc_id: {doc_id}). Reactivating...")
+                        await rag.aactive_by_doc_id(doc_id)
+                        return InsertResponse(
+                            status="success",
+                            message=f"File '{safe_filename}' was previously deleted and has been restored.",
+                            track_id=existing_doc_data.get("track_id") or "",
+                        )
+
                 status = existing_doc_data.get("status", "unknown")
                 existing_track_id = existing_doc_data.get("track_id") or ""
                 logger.warning(
@@ -3257,9 +3283,22 @@ def create_document_routes(
                 and request.file_source != "unknown_source"
             ):
                 existing_doc_data = await rag.doc_status.get_doc_by_file_path(
-                    request.file_source
+                    request.file_source, include_deleted=True
                 )
                 if existing_doc_data:
+                     # Check if it's soft-deleted
+                    if existing_doc_data.get("isDeleted", False):
+                         # Reactivate instead of re-ingesting
+                        doc_id = existing_doc_data.get("id")
+                        if doc_id:
+                            logger.info(f"[TEXT INSERT] Found soft-deleted source '{request.file_source}' (doc_id: {doc_id}). Reactivating...")
+                            await rag.aactive_by_doc_id(doc_id)
+                            return InsertResponse(
+                                status="success",
+                                message=f"File source '{request.file_source}' was previously deleted and has been restored.",
+                                track_id=existing_doc_data.get("track_id") or "",
+                            )
+
                     # Get document status and track_id from existing document
                     status = existing_doc_data.get("status", "unknown")
                     # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
@@ -4101,6 +4140,285 @@ def create_document_routes(
             error_msg = f"Error initiating document deletion for file_id='{file_id}': {str(e)}"
             logger.error(error_msg)
             logger.error(traceback.format_exc())
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    # Request models for Soft Delete
+    class SoftDeleteDocRequest(BaseModel):
+        doc_ids: List[str] = Field(description="List of document IDs to soft delete")
+
+    class ActiveByFileIdRequest(BaseModel):
+        file_id: str = Field(description="The file_id to reactivate documents for")
+        run_in_background: bool = Field(default=True, description="Whether to run in background")
+
+    async def background_soft_delete_documents(
+        rag_instance: LightRAG,
+        doc_ids: List[str],
+    ):
+        """Background task for soft deleting a list of documents."""
+        try:
+            # We iterate and call the single doc method which handles locking/status individually.
+            # This ensures we don't block the pipeline for the entire batch if something goes wrong,
+            # and allows other small operations to interleave if needed (though busy=True usually blocks).
+            for doc_id in doc_ids:
+                try:
+                    await rag_instance.asoft_delete_by_doc_id(doc_id)
+                except Exception as e:
+                    logger.error(f"Error in background soft delete for {doc_id}: {e}")
+        except Exception as master_e:
+            logger.error(f"Error in background soft delete wrapper: {master_e}")
+
+    @router.delete(
+        "/delete_document_soft",
+        response_model=DeleteDocByIdResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Soft delete documents by IDs.",
+    )
+    async def delete_document_soft(
+        request: SoftDeleteDocRequest,
+        background_tasks: BackgroundTasks,
+    ) -> DeleteDocByIdResponse:
+        """
+        Soft delete documents by their IDs.
+        
+        This marks documents as deleted (isDeleted=True) without physically removing data.
+        """
+        doc_ids = request.doc_ids
+        
+        try:
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+            
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=rag.workspace
+            )
+            
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                     return DeleteDocByIdResponse(
+                        status="busy",
+                        message="Cannot delete documents while pipeline is busy",
+                        doc_id=", ".join(doc_ids),
+                    )
+            
+            background_tasks.add_task(
+                background_soft_delete_documents,
+                rag,
+                doc_ids,
+            )
+            
+            return DeleteDocByIdResponse(
+                status="deletion_started",
+                message=f"Soft deletion for {len(doc_ids)} documents has been initiated in background.",
+                doc_id=", ".join(doc_ids),
+            )
+
+        except Exception as e:
+            error_msg = f"Error initiating soft deletion: {str(e)}"
+            logger.error(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    @router.delete(
+        "/delete_by_table_name_soft",
+        response_model=DeleteByTableNameResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Soft delete all documents with a specific table_name.",
+    )
+    async def delete_by_table_name_soft(
+        delete_request: DeleteByTableNameRequest,
+        background_tasks: BackgroundTasks,
+    ) -> DeleteByTableNameResponse:
+        """Soft delete documents by table_name. Ignores delete_file/cache options."""
+        table_name = delete_request.table_name
+        
+        try:
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+            
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=rag.workspace
+            )
+            
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                     return DeleteByTableNameResponse(
+                        status="busy",
+                        table_name=table_name,
+                        total_docs=0,
+                        deleted_docs=[],
+                        failed_docs=[],
+                        message="Cannot delete documents while pipeline is busy",
+                    )
+            
+            if delete_request.run_in_background:
+                background_tasks.add_task(
+                    rag.asoft_delete_by_table_name,
+                    table_name,
+                )
+                return DeleteByTableNameResponse(
+                    status="deletion_started",
+                    table_name=table_name,
+                    total_docs=0,
+                    deleted_docs=[],
+                    failed_docs=[],
+                    message=f"Soft deletion for table_name='{table_name}' initiated in background.",
+                )
+            else:
+                result = await rag.asoft_delete_by_table_name(table_name)
+                # Ensure result matches response model fields
+                return DeleteByTableNameResponse(
+                    status=result["status"],
+                    table_name=result.get("table_name", table_name), # asoft_delete might not return table_name in dict? asoft_delete_by_table_name implementation returns it.
+                    total_docs=result["total_docs"],
+                    deleted_docs=result["deleted_docs"],
+                    failed_docs=result["failed_docs"],
+                    message=result["message"],
+                )
+
+        except Exception as e:
+            error_msg = f"Error initiating soft deletion for table_name='{table_name}': {str(e)}"
+            logger.error(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    @router.delete(
+        "/delete_by_file_id_soft",
+        response_model=DeleteByFileIdResponse,
+        dependencies=[Depends(combined_auth)],
+        summary="Soft delete all documents with a specific file_id.",
+    )
+    async def delete_by_file_id_soft(
+        delete_request: DeleteByFileIdRequest,
+        background_tasks: BackgroundTasks,
+    ) -> DeleteByFileIdResponse:
+        """Soft delete documents by file_id. Ignores delete_file/cache options."""
+        file_id = delete_request.file_id
+        
+        try:
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+            
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=rag.workspace
+            )
+            
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                    return DeleteByFileIdResponse(
+                        status="busy",
+                        file_id=file_id,
+                        total_docs=0,
+                        deleted_docs=[],
+                        failed_docs=[],
+                        message="Cannot delete documents while pipeline is busy",
+                    )
+            
+            if delete_request.run_in_background:
+                background_tasks.add_task(
+                    rag.asoft_delete_by_file_id,
+                    file_id,
+                )
+                return DeleteByFileIdResponse(
+                    status="deletion_started",
+                    file_id=file_id,
+                    total_docs=0,
+                    deleted_docs=[],
+                    failed_docs=[],
+                    message=f"Soft deletion for file_id='{file_id}' initiated in background.",
+                )
+            else:
+                result = await rag.asoft_delete_by_file_id(file_id)
+                return DeleteByFileIdResponse(
+                    status=result["status"],
+                    file_id=file_id,
+                    total_docs=result.get("total_docs", 0),
+                    deleted_docs=result.get("deleted_docs", []),
+                    failed_docs=result.get("failed_docs", []),
+                    message=result["message"],
+                )
+
+        except Exception as e:
+            error_msg = f"Error initiating soft deletion for file_id='{file_id}': {str(e)}"
+            logger.error(error_msg)
+            raise HTTPException(status_code=500, detail=error_msg)
+
+    @router.post(
+        "/active_by_file_id",
+        response_model=DeleteByFileIdResponse, # Reuse response model as structure is same
+        dependencies=[Depends(combined_auth)],
+        summary="Reactivate all documents with a specific file_id.",
+    )
+    async def active_by_file_id(
+        request: ActiveByFileIdRequest,
+        background_tasks: BackgroundTasks,
+    ) -> DeleteByFileIdResponse:
+        """Reactivate soft-deleted documents by file_id."""
+        file_id = request.file_id
+        
+        try:
+            from lightrag.kg.shared_storage import (
+                get_namespace_data,
+                get_namespace_lock,
+            )
+            
+            pipeline_status = await get_namespace_data(
+                "pipeline_status", workspace=rag.workspace
+            )
+            pipeline_status_lock = get_namespace_lock(
+                "pipeline_status", workspace=rag.workspace
+            )
+            
+            async with pipeline_status_lock:
+                if pipeline_status.get("busy", False):
+                    return DeleteByFileIdResponse(
+                        status="busy",
+                        file_id=file_id,
+                        total_docs=0,
+                        deleted_docs=[],
+                        failed_docs=[],
+                        message="Cannot reactivate documents while pipeline is busy",
+                    )
+            
+            if request.run_in_background:
+                background_tasks.add_task(
+                    rag.aactive_by_file_id,
+                    file_id,
+                )
+                return DeleteByFileIdResponse(
+                    status="deletion_started", # Reuse status enum from existing model
+                    file_id=file_id,
+                    total_docs=0,
+                    deleted_docs=[],
+                    failed_docs=[],
+                    message=f"Reactivation for file_id='{file_id}' initiated in background.",
+                )
+            else:
+                result = await rag.aactive_by_file_id(file_id)
+                return DeleteByFileIdResponse(
+                    status=result["status"],
+                    file_id=result.get("file_id", file_id),
+                    total_docs=result.get("total_docs", 0),
+                    deleted_docs=result.get("deleted_docs", []), # These are "reactivated" docs
+                    failed_docs=result.get("failed_docs", []),
+                    message=result["message"],
+                )
+
+        except Exception as e:
+            error_msg = f"Error initiating reactivation for file_id='{file_id}': {str(e)}"
+            logger.error(error_msg)
             raise HTTPException(status_code=500, detail=error_msg)
 
     @router.post(

@@ -351,6 +351,20 @@ class BaseVectorStorage(StorageNameSpace, ABC):
             ids: List of vector IDs to be deleted
         """
 
+    async def soft_delete(self, ids: list[str], is_deleted: bool = True):
+        """Mark vectors with specified IDs as deleted or active.
+
+        Importance notes for in-memory storage:
+        1. Changes will be persisted to disk during the next index_done_callback
+        2. Only one process should updating the storage at a time before index_done_callback,
+           KG-storage-log should be used to avoid data corruption
+
+        Args:
+            ids: List of vector IDs to be updated
+            is_deleted: True to mark as deleted, False to reactivate
+        """
+        raise NotImplementedError("Soft delete is not implemented for this storage backend.")
+
     @abstractmethod
     async def get_vectors_by_ids(self, ids: list[str]) -> dict[str, list[float]]:
         """Get vectors by their IDs, returning only ID and vector data for efficiency
@@ -404,6 +418,22 @@ class BaseKVStorage(StorageNameSpace, ABC):
         Returns:
             None
         """
+
+    async def soft_delete(self, ids: list[str], is_deleted: bool = True) -> None:
+        """Mark specific records as deleted or active.
+
+        Importance notes for in-memory storage:
+        1. Changes will be persisted to disk during the next index_done_callback
+        2. update flags to notify other processes that data persistence is needed
+
+        Args:
+            ids: List of document IDs to be updated
+            is_deleted: True to mark as deleted, False to reactivate
+
+        Returns:
+            None
+        """
+        raise NotImplementedError("Soft delete is not implemented for this storage backend.")
 
     @abstractmethod
     async def is_empty(self) -> bool:
@@ -622,6 +652,25 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             node_id: The ID of the node to delete
         """
 
+    async def soft_delete_node(self, node_id: str, is_deleted: bool = True) -> None:
+        """Mark a node as deleted or active.
+
+        Args:
+            node_id: The ID of the node to update
+            is_deleted: True to mark as deleted, False to reactivate
+        """
+        raise NotImplementedError("Soft delete node is not implemented for this storage backend.")
+
+    async def soft_delete_edge(self, source_node_id: str, target_node_id: str, is_deleted: bool = True) -> None:
+        """Mark an edge as deleted or active.
+
+        Args:
+            source_node_id: The ID of the source node
+            target_node_id: The ID of the target node
+            is_deleted: True to mark as deleted, False to reactivate
+        """
+        raise NotImplementedError("Soft delete edge is not implemented for this storage backend.")
+
     @abstractmethod
     async def remove_nodes(self, nodes: list[str]):
         """Delete multiple nodes
@@ -635,6 +684,15 @@ class BaseGraphStorage(StorageNameSpace, ABC):
             nodes: List of node IDs to be deleted
         """
 
+    async def soft_remove_nodes(self, nodes: list[str], is_deleted: bool = True):
+        """Soft delete multiple nodes
+
+        Args:
+            nodes: List of node IDs to be updated
+            is_deleted: True to mark as deleted, False to reactivate
+        """
+        raise NotImplementedError("Soft remove nodes is not implemented for this storage backend.")
+
     @abstractmethod
     async def remove_edges(self, edges: list[tuple[str, str]]):
         """Delete multiple edges
@@ -647,6 +705,15 @@ class BaseGraphStorage(StorageNameSpace, ABC):
         Args:
             edges: List of edges to be deleted, each edge is a (source, target) tuple
         """
+
+    async def soft_remove_edges(self, edges: list[tuple[str, str]], is_deleted: bool = True):
+        """Soft delete multiple edges
+
+        Args:
+            edges: List of edges to be updated, each edge is a (source, target) tuple
+            is_deleted: True to mark as deleted, False to reactivate
+        """
+        raise NotImplementedError("Soft remove edges is not implemented for this storage backend.")
 
     @abstractmethod
     async def get_all_labels(self) -> list[str]:
@@ -751,6 +818,8 @@ class DocProcessingStatus:
     """Error message if failed"""
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional metadata"""
+    isDeleted: bool = False
+    """Soft delete flag"""
     multimodal_processed: bool | None = field(default=None, repr=False)
     """Internal field: indicates if multimodal processing is complete. Not shown in repr() but accessible for debugging."""
 
@@ -823,7 +892,7 @@ class DocStatusStorage(BaseKVStorage, ABC):
         """
 
     @abstractmethod
-    async def get_doc_by_file_path(self, file_path: str) -> dict[str, Any] | None:
+    async def get_doc_by_file_path(self, file_path: str, include_deleted: bool = False) -> dict[str, Any] | None:
         """Get document by file path
 
         Args:
