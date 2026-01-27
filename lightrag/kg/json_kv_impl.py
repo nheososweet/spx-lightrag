@@ -139,8 +139,8 @@ class JsonKVStorage(BaseKVStorage):
                     result["_id"] = id
                     ordered_results.append(result)
                 else:
-                    results.append(None)
-            return results
+                    ordered_results.append(None)
+            return ordered_results
 
     async def filter_keys(self, keys: set[str]) -> set[str]:
         async with self._storage_lock:

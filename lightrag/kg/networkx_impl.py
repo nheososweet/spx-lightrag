@@ -243,7 +243,7 @@ class NetworkXStorage(BaseGraphStorage):
         1. Changes will be persisted to disk during the next index_done_callback
         2. Only one process should updating the storage at a time before index_done_callback,
            KG-storage-log should be used to avoid data corruption
-
+        """
         graph = await self._get_graph()
         for source, target in edges:
             if graph.has_edge(source, target):
@@ -264,7 +264,6 @@ class NetworkXStorage(BaseGraphStorage):
         Returns:
             [label1, label2, ...]  # Alphabetically sorted label list
         """
-        """
         graph = await self._get_graph()
         query_graph = self._get_query_graph(graph)
         labels = set()
@@ -283,7 +282,6 @@ class NetworkXStorage(BaseGraphStorage):
 
         Returns:
             List of labels sorted by degree (highest first)
-        """
         """
         graph = await self._get_graph()
         query_graph = self._get_query_graph(graph)
@@ -311,7 +309,6 @@ class NetworkXStorage(BaseGraphStorage):
 
         Returns:
             List of matching labels sorted by relevance
-        """
         """
         graph = await self._get_graph()
         query_graph = self._get_query_graph(graph)
@@ -384,8 +381,6 @@ class NetworkXStorage(BaseGraphStorage):
             # Limit max_nodes to not exceed global_config max_graph_nodes
             max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
 
-            max_nodes = min(max_nodes, self.global_config.get("max_graph_nodes", 1000))
-
         graph = await self._get_graph()
         query_graph = self._get_query_graph(graph)
 
@@ -449,6 +444,18 @@ class NetworkXStorage(BaseGraphStorage):
                             # Add neighbor nodes to queue with incremented depth
                             neighbors = list(query_graph.neighbors(current_node))
                             # Filter out already visited neighbors
+                            unvisited_neighbors = [n for n in neighbors if n not in visited]
+                            
+                            if unvisited_neighbors:
+                                # Add neighbors to queue with their degrees
+                                for neighbor in unvisited_neighbors:
+                                    neighbor_degree = query_graph.degree(neighbor)
+                                    queue.append((neighbor, depth + 1, neighbor_degree))
+                        else:
+                            # Check if this node has unexplored neighbors
+                            if any(n not in visited for n in query_graph.neighbors(current_node)):
+                                has_unexplored_neighbors = True
+
             if (queue and len(bfs_nodes) >= max_nodes) or has_unexplored_neighbors:
                 if len(bfs_nodes) >= max_nodes:
                     result.is_truncated = True
@@ -524,7 +531,6 @@ class NetworkXStorage(BaseGraphStorage):
         Returns:
             A list of all nodes, where each node is a dictionary of its properties
         """
-        """
         graph = await self._get_graph()
         query_graph = self._get_query_graph(graph)
         all_nodes = []
@@ -539,7 +545,6 @@ class NetworkXStorage(BaseGraphStorage):
 
         Returns:
             A list of all edges, where each edge is a dictionary of its properties
-        """
         """
         graph = await self._get_graph()
         query_graph = self._get_query_graph(graph)
