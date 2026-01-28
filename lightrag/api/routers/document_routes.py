@@ -3027,6 +3027,156 @@ def create_document_routes(
             logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
 
+    async def _internal_upload_from_url(
+        file_url: str,
+        table_name: str,
+        file_id: str,
+        run_background: bool,
+        background_tasks: BackgroundTasks,
+    ) -> InsertResponse:
+        """Internal helper for upload_from_url logic, shared by multiple endpoints."""
+        logger.info(f"[INTERNAL UPLOAD] Processing: {file_url} (table: {table_name}, id: {file_id})")
+        
+        try:
+            # Extract filename from URL
+            url_path = file_url.rstrip("/")
+            filename = url_path.split("/")[-1]
+            if not filename or "." not in filename:
+                raise HTTPException(
+                    status_code=400, detail="Cannot extract valid filename from URL"
+                )
+
+            # Sanitize filename
+            safe_filename = sanitize_filename(filename, doc_manager.input_dir)
+
+            # Validating file type
+            if not doc_manager.is_supported_file(safe_filename):
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
+                )
+
+            # Check if file_id already exists in chunks_vdb (Milvus)
+            if file_id:
+                try:
+                    if hasattr(rag.chunks_vdb, "get_doc_ids_by_file_id"):
+                        existing_doc_ids = await rag.chunks_vdb.get_doc_ids_by_file_id(file_id, include_deleted=True)
+                        
+                        if existing_doc_ids:
+                            all_deleted = True
+                            doc_statuses = []
+                            for d_id in existing_doc_ids:
+                                d_status = await rag.doc_status.get_by_id(d_id)
+                                if d_status and not d_status.get("isDeleted", False):
+                                    all_deleted = False
+                                doc_statuses.append((d_id, d_status))
+                            
+                            if all_deleted:
+                                logger.info(f"[INTERNAL UPLOAD] Found {len(existing_doc_ids)} soft-deleted documents with file_id='{file_id}'. Reactivating...")
+                                for d_id, _ in doc_statuses:
+                                    if d_id:
+                                        await rag.aactive_by_doc_id(d_id)
+                                
+                                track_id = doc_statuses[0][1].get("track_id") if doc_statuses and doc_statuses[0][1] else ""
+                                return InsertResponse(
+                                    status="success",
+                                    message=f"Documents with file_id='{file_id}' were previously deleted and have been restored.",
+                                    track_id=track_id or "",
+                                )
+                            else:
+                                 logger.warning(f"[INTERNAL UPLOAD] Duplicate file_id found: {file_id}")
+                                 track_id = doc_statuses[0][1].get("track_id") if doc_statuses and doc_statuses[0][1] else ""
+                                 return InsertResponse(
+                                    status="duplicated",
+                                    message=f"Document with file_id='{file_id}' already exists.",
+                                    track_id=track_id or "",
+                                 )
+                except Exception as e:
+                    logger.warning(f"[INTERNAL UPLOAD] Failed to check duplicate file_id: {e}")
+
+            # Check if filename already exists in doc_status storage
+            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename, include_deleted=True)
+            if existing_doc_data:
+                if existing_doc_data.get("isDeleted", False):
+                    doc_id = existing_doc_data.get("id")
+                    if doc_id:
+                        logger.info(f"[INTERNAL UPLOAD] Found soft-deleted file '{safe_filename}'. Reactivating...")
+                        await rag.aactive_by_doc_id(doc_id)
+                        return InsertResponse(
+                            status="success",
+                            message=f"File '{safe_filename}' was previously deleted and has been restored.",
+                            track_id=existing_doc_data.get("track_id") or "",
+                        )
+
+                status = existing_doc_data.get("status", "unknown")
+                existing_track_id = existing_doc_data.get("track_id") or ""
+                return InsertResponse(
+                    status="duplicated",
+                    message=f"File '{safe_filename}' already exists in document storage (Status: {status}).",
+                    track_id=existing_track_id,
+                )
+
+            file_path = doc_manager.input_dir / safe_filename
+            if file_path.exists():
+                return InsertResponse(
+                    status="duplicated",
+                    message=f"File '{safe_filename}' already exists in the input directory.",
+                    track_id="",
+                )
+
+            # Download file from URL
+            downloaded_bytes = 0
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(file_url, timeout=aiohttp.ClientTimeout(total=300)) as response:
+                        if response.status != 200:
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Failed to download file. HTTP {response.status}: {response.reason}",
+                            )
+
+                        async with aiofiles.open(file_path, "wb") as f:
+                            async for chunk in response.content.iter_chunked(8192):
+                                await f.write(chunk)
+                                downloaded_bytes += len(chunk)
+                logger.info(f"[INTERNAL UPLOAD] ✓ Download completed: {downloaded_bytes / 1024:.2f} KB")
+
+            except Exception as e:
+                if isinstance(e, HTTPException): raise
+                raise HTTPException(status_code=500, detail=f"Failed to download file from URL: {str(e)}")
+
+            # Generate track_id
+            track_id = generate_track_id("upload_url")
+            custom_metadata = {
+                "file_url": file_url,
+                "table_name": table_name,
+                "file_id": file_id,
+            }
+
+            if run_background:
+                background_tasks.add_task(
+                    pipeline_index_file_with_metadata,
+                    rag,
+                    file_path,
+                    track_id,
+                    custom_metadata,
+                )
+                message = f"File '{safe_filename}' downloaded from URL and queued for processing."
+            else:
+                await pipeline_index_file_with_metadata(
+                    rag,
+                    file_path,
+                    track_id,
+                    custom_metadata,
+                )
+                message = f"File '{safe_filename}' downloaded and processed successfully."
+
+            return InsertResponse(status="success", message=message, track_id=track_id)
+
+        except Exception as e:
+            if isinstance(e, HTTPException): raise
+            raise HTTPException(status_code=500, detail=str(e))
+
     @router.post(
         "/upload_from_url",
         response_model=InsertResponse,
@@ -3037,276 +3187,14 @@ def create_document_routes(
     ):
         """
         Download file from URL and upload to the RAG system with custom metadata.
-
-        This endpoint downloads a file from the provided URL, saves it to the input directory,
-        and processes it with custom metadata (file_url, table_name, file_id) that will be
-        stored in Milvus Dynamic Fields alongside the chunk content.
-
-        **Workflow:**
-        1. Validate URL and extract filename
-        2. Check for duplicate files (same as /upload)
-        3. Download file from URL to input directory
-        4. Process file with custom metadata injection (if run_background=true)
-        5. Store file_url, table_name, file_id in Milvus chunks Dynamic Fields
-
-        **Processing Modes:**
-        - `run_background=true` (default): File is queued for background processing, returns immediately with track_id
-        - `run_background=false`: Waits for file processing to complete before returning (useful for FE workers)
-
-        Args:
-            request (UploadFromURLRequest): Request containing:
-                - file_url: URL of the file to download
-                - table_name: Table name for categorizing the document
-                - file_id: Unique identifier for the file
-                - run_background: Whether to process in background (True) or wait for completion (False)
-            background_tasks: FastAPI BackgroundTasks for async processing (used only when run_background=true)
-
-        Returns:
-            InsertResponse: Response with upload status and track_id
-                - status="success": File downloaded and queued/processed successfully
-                - status="duplicated": File already exists
-                - track_id: Unique identifier to track document processing status
-
-        Raises:
-            HTTPException: If URL is invalid (400), download fails (500), processing fails (500), or other errors occur
         """
-        logger.info(f"[UPLOAD FROM URL] ========== NEW REQUEST ==========")
-        logger.info(f"[UPLOAD FROM URL] Received request with:")
-        logger.info(f"[UPLOAD FROM URL]   - file_url: {request.file_url}")
-        logger.info(f"[UPLOAD FROM URL]   - table_name: {request.table_name}")
-        logger.info(f"[UPLOAD FROM URL]   - file_id: {request.file_id}")
-        
-        try:
-            # Extract filename from URL
-            logger.info(f"[UPLOAD FROM URL] Step 1/6: Extracting filename from URL")
-            url_path = request.file_url.rstrip("/")
-            filename = url_path.split("/")[-1]
-            logger.info(f"[UPLOAD FROM URL] Extracted filename: {filename}")
-            
-            if not filename or "." not in filename:
-                logger.error(f"[UPLOAD FROM URL] Invalid filename extracted from URL: {filename}")
-                raise HTTPException(
-                    status_code=400, detail="Cannot extract valid filename from URL"
-                )
-
-            # Sanitize filename
-            logger.info(f"[UPLOAD FROM URL] Step 2/6: Sanitizing filename")
-            safe_filename = sanitize_filename(filename, doc_manager.input_dir)
-            logger.info(f"[UPLOAD FROM URL] Sanitized filename: {safe_filename}")
-
-            logger.info(f"[UPLOAD FROM URL] Step 3/6: Validating file type")
-            if not doc_manager.is_supported_file(safe_filename):
-                logger.error(f"[UPLOAD FROM URL] Unsupported file type: {safe_filename}")
-                logger.error(f"[UPLOAD FROM URL] Supported types: {doc_manager.supported_extensions}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
-                )
-            logger.info(f"[UPLOAD FROM URL] ✓ File type is supported")
-
-            # Step 3.5: Check if file_id already exists in chunks_vdb (Milvus)
-            if request.file_id:
-                logger.info(f"[UPLOAD FROM URL] Step 3.5/6: Checking for duplicate file_id: {request.file_id}")
-                try:
-                    # Check if chunks_vdb supports get_doc_ids_by_file_id (MilvusVectorDBStorage specific)
-                    if hasattr(rag.chunks_vdb, "get_doc_ids_by_file_id"):
-                        existing_doc_ids = await rag.chunks_vdb.get_doc_ids_by_file_id(request.file_id, include_deleted=True)
-                        
-                        if existing_doc_ids:
-                            all_deleted = True
-                            doc_statuses = []
-                            
-                            for d_id in existing_doc_ids:
-                                d_status = await rag.doc_status.get_by_id(d_id)
-                                if d_status and not d_status.get("isDeleted", False):
-                                    all_deleted = False
-                                doc_statuses.append((d_id, d_status))
-                            
-                            if all_deleted:
-                                logger.info(f"[UPLOAD FROM URL] Found {len(existing_doc_ids)} soft-deleted documents with file_id='{request.file_id}'. Reactivating...")
-                                for d_id, _ in doc_statuses:
-                                    if d_id:
-                                        await rag.aactive_by_doc_id(d_id)
-                                
-                                track_id = doc_statuses[0][1].get("track_id") if doc_statuses and doc_statuses[0][1] else ""
-                                return InsertResponse(
-                                    status="success",
-                                    message=f"Documents with file_id='{request.file_id}' were previously deleted and have been restored.",
-                                    track_id=track_id or "",
-                                )
-                            else:
-                                 # Duplicate found and NOT all deleted.
-                                 logger.warning(f"[UPLOAD FROM URL] Duplicate file_id found: {request.file_id} (some active)")
-                                 track_id = doc_statuses[0][1].get("track_id") if doc_statuses and doc_statuses[0][1] else ""
-                                 return InsertResponse(
-                                    status="duplicated",
-                                    message=f"Document with file_id='{request.file_id}' already exists.",
-                                    track_id=track_id or "",
-                                 )
-
-                except Exception as e:
-                    logger.warning(f"[UPLOAD FROM URL] Failed to check duplicate file_id: {e}")
-
-            # Check if filename already exists in doc_status storage
-            logger.info(f"[UPLOAD FROM URL] Step 4/6: Checking for duplicates")
-            logger.debug(f"[UPLOAD FROM URL] Checking doc_status storage...")
-            existing_doc_data = await rag.doc_status.get_doc_by_file_path(safe_filename, include_deleted=True)
-            if existing_doc_data:
-                # Check if it's soft-deleted
-                if existing_doc_data.get("isDeleted", False):
-                    # Reactivate instead of re-ingesting
-                    doc_id = existing_doc_data.get("id")
-                    if doc_id:
-                        logger.info(f"[UPLOAD FROM URL] Found soft-deleted file '{safe_filename}' (doc_id: {doc_id}). Reactivating...")
-                        await rag.aactive_by_doc_id(doc_id)
-                        return InsertResponse(
-                            status="success",
-                            message=f"File '{safe_filename}' was previously deleted and has been restored.",
-                            track_id=existing_doc_data.get("track_id") or "",
-                        )
-
-                status = existing_doc_data.get("status", "unknown")
-                existing_track_id = existing_doc_data.get("track_id") or ""
-                logger.warning(
-                    f"[UPLOAD FROM URL] ⚠ Duplicate found in doc_status: {safe_filename} (Status: {status}, Track ID: {existing_track_id})"
-                )
-                return InsertResponse(
-                    status="duplicated",
-                    message=f"File '{safe_filename}' already exists in document storage (Status: {status}).",
-                    track_id=existing_track_id,
-                )
-
-            file_path = doc_manager.input_dir / safe_filename
-            logger.debug(f"[UPLOAD FROM URL] Checking file system: {file_path}")
-            if file_path.exists():
-                logger.warning(f"[UPLOAD FROM URL] ⚠ File already exists in file system: {safe_filename}")
-                return InsertResponse(
-                    status="duplicated",
-                    message=f"File '{safe_filename}' already exists in the input directory.",
-                    track_id="",
-                )
-            logger.info(f"[UPLOAD FROM URL] ✓ No duplicates found")
-
-            # Download file from URL
-            logger.info(f"[UPLOAD FROM URL] Step 5/6: Downloading file from URL")
-            logger.info(f"[UPLOAD FROM URL] Target path: {file_path}")
-            
-            downloaded_bytes = 0
-            try:
-                async with aiohttp.ClientSession() as session:
-                    logger.debug(f"[UPLOAD FROM URL] Creating HTTP session...")
-                    async with session.get(request.file_url, timeout=aiohttp.ClientTimeout(total=300)) as response:
-                        logger.info(f"[UPLOAD FROM URL] HTTP Response: {response.status} {response.reason}")
-                        logger.info(f"[UPLOAD FROM URL] Content-Type: {response.headers.get('Content-Type', 'unknown')}")
-                        content_length = response.headers.get('Content-Length')
-                        if content_length:
-                            logger.info(f"[UPLOAD FROM URL] Content-Length: {int(content_length) / 1024:.2f} KB")
-                        
-                        if response.status != 200:
-                            logger.error(f"[UPLOAD FROM URL] Download failed with HTTP {response.status}")
-                            raise HTTPException(
-                                status_code=500,
-                                detail=f"Failed to download file. HTTP {response.status}: {response.reason}",
-                            )
-
-                        # Save file to disk
-                        logger.info(f"[UPLOAD FROM URL] Starting file write to disk...")
-                        async with aiofiles.open(file_path, "wb") as f:
-                            chunk_count = 0
-                            async for chunk in response.content.iter_chunked(8192):
-                                await f.write(chunk)
-                                downloaded_bytes += len(chunk)
-                                chunk_count += 1
-                                
-                                # Log progress every 100 chunks (~800KB)
-                                if chunk_count % 100 == 0:
-                                    logger.debug(f"[UPLOAD FROM URL] Downloaded {downloaded_bytes / 1024:.2f} KB ({chunk_count} chunks)")
-
-                logger.info(f"[UPLOAD FROM URL] ✓ Download completed: {downloaded_bytes / 1024:.2f} KB")
-                logger.info(f"[UPLOAD FROM URL] ✓ File saved to: {file_path.name}")
-
-            except aiohttp.ClientError as e:
-                logger.error(f"[UPLOAD FROM URL] ❌ Network error during download: {str(e)}")
-                raise HTTPException(
-                    status_code=500, detail=f"Failed to download file from URL: {str(e)}"
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"[UPLOAD FROM URL] ❌ Download timeout (max 300s)")
-                raise HTTPException(
-                    status_code=500, detail="File download timed out (max 300s)"
-                )
-
-            # Generate track_id
-            logger.info(f"[UPLOAD FROM URL] Step 6/6: Queuing background processing")
-            track_id = generate_track_id("upload_url")
-            logger.info(f"[UPLOAD FROM URL] Generated track_id: {track_id}")
-
-            # Prepare custom metadata for injection
-            custom_metadata = {
-                "file_url": request.file_url,
-                "table_name": request.table_name,
-                "file_id": request.file_id,
-            }
-            logger.info(f"[UPLOAD FROM URL] Prepared metadata: {custom_metadata}")
-
-            # Check if should run in background or wait for completion
-            if request.run_background:
-                # Add to background tasks with metadata injection (original behavior)
-                logger.info(f"[UPLOAD FROM URL] Adding to background tasks...")
-                background_tasks.add_task(
-                    pipeline_index_file_with_metadata,
-                    rag,
-                    file_path,
-                    track_id,
-                    custom_metadata,
-                )
-                logger.info(f"[UPLOAD FROM URL] ✓ Background task queued successfully")
-                message = f"File '{safe_filename}' downloaded from URL and queued for processing with custom metadata."
-            else:
-                # Process synchronously and wait for completion (for FE worker)
-                logger.info(f"[UPLOAD FROM URL] Processing synchronously (run_background=False)...")
-                try:
-                    await pipeline_index_file_with_metadata(
-                        rag,
-                        file_path,
-                        track_id,
-                        custom_metadata,
-                    )
-                    logger.info(f"[UPLOAD FROM URL] ✓ Synchronous processing completed successfully")
-                    message = f"File '{safe_filename}' downloaded from URL and processed successfully with custom metadata."
-                except Exception as e:
-                    logger.error(f"[UPLOAD FROM URL] ❌ Synchronous processing failed: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"File processing failed: {str(e)}"
-                    )
-
-            logger.info(f"[UPLOAD FROM URL] ========== REQUEST COMPLETED ==========")
-            logger.info(f"[UPLOAD FROM URL] Summary:")
-            logger.info(f"[UPLOAD FROM URL]   - File: {safe_filename}")
-            logger.info(f"[UPLOAD FROM URL]   - Size: {downloaded_bytes / 1024:.2f} KB")
-            logger.info(f"[UPLOAD FROM URL]   - Track ID: {track_id}")
-            logger.info(f"[UPLOAD FROM URL]   - Metadata: {custom_metadata}")
-            logger.info(f"[UPLOAD FROM URL]   - Run background: {request.run_background}")
-            
-            return InsertResponse(
-                status="success",
-                message=message,
-                track_id=track_id,
-            )
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"[UPLOAD FROM URL] ❌ UNEXPECTED ERROR: {str(e)}")
-            logger.error(f"[UPLOAD FROM URL] Request context:")
-            logger.error(f"[UPLOAD FROM URL]   - file_url: {request.file_url}")
-            logger.error(f"[UPLOAD FROM URL]   - table_name: {request.table_name}")
-            logger.error(f"[UPLOAD FROM URL]   - file_id: {request.file_id}")
-            logger.error(f"[UPLOAD FROM URL] Full traceback:")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+        return await _internal_upload_from_url(
+            file_url=request.file_url,
+            table_name=request.table_name,
+            file_id=request.file_id,
+            run_background=request.run_background,
+            background_tasks=background_tasks,
+        )
 
     @router.post(
         "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)], include_in_schema=False
@@ -4839,310 +4727,55 @@ def create_document_routes(
         request: ReplaceFileByIdRequest, background_tasks: BackgroundTasks
     ):
         """
-        Replace an existing file by deleting old version and uploading new version.
-
+        Replace an existing file by soft-deleting old version and uploading new version.
+        
         This endpoint performs a two-step operation:
-        1. **Delete**: Remove all documents associated with the specified file_id
-           (including chunks, entities, relationships, and optionally LLM cache)
-        2. **Upload**: Download and process the new file with the same file_id
-
-        This is useful for updating documents while maintaining the same file_id reference,
-        ensuring consistency with external systems that track files by file_id.
-
-        **Important Notes:**
-        - The file_id must exist in the system (have associated documents)
-        - If deletion succeeds but upload fails, the old data is already removed
-        - Use run_background=False if you need to ensure both operations complete
-        - Set delete_llm_cache=True (default) to ensure fresh extraction of new file
-
-        **Workflow:**
-        1. Validate file_id exists and has documents
-        2. Delete all documents with matching file_id
-        3. Download new file from URL
-        4. Process new file with same file_id and table_name metadata
-
-        **Processing Modes:**
-        - `run_background=true` (default): Both delete and upload happen in background
-        - `run_background=false`: Wait for both operations to complete before returning
-
+        1. **Soft Delete**: Mark all documents associated with old_file_id as deleted.
+        2. **Upload**: Download and process the new file (similar to upload_from_url).
+        
         Args:
-            request (ReplaceFileByIdRequest): Request containing:
-                - file_id: Unique identifier of file to replace (must exist)
-                - file_url: URL of new file to download
-                - table_name: Table name for new document
-                - run_background: Whether to process in background
-                - delete_llm_cache: Whether to delete old LLM extraction cache
-            background_tasks: FastAPI BackgroundTasks (used only when run_background=true)
-
+            request (ReplaceFileByIdRequest): Request containing old_file_id, new file_id, file_url, etc.
+            background_tasks: FastAPI BackgroundTasks
+            
         Returns:
-            dict: Response containing:
-                - status: "success", "not_found", "partial_success", or "failure"
-                - file_id: The file_id that was replaced
-                - deletion_result: Details of old file deletion
-                - upload_result: Details of new file upload (if successful)
-                - message: Summary of the operation
-                - track_id: Track ID for new upload (for monitoring progress)
-
-        Raises:
-            HTTPException: 
-                - 404: If file_id not found
-                - 500: If deletion or upload fails
-
-        Example:
-            >>> # Replace file synchronously (wait for completion)
-            >>> response = await replace_file_by_id({
-            ...     "file_id": "POL_001",
-            ...     "file_url": "https://example.com/policy_v2.pdf",
-            ...     "table_name": "policies",
-            ...     "run_background": False,
-            ...     "delete_llm_cache": True
-            ... })
+            dict: Combined result of deletion and upload.
         """
-        logger.info(f"[REPLACE FILE] ========== NEW REQUEST ==========")
-        logger.info(f"[REPLACE FILE] Received request:")
-        logger.info(f"[REPLACE FILE]   - old_file_id: {request.old_file_id} (to delete)")
-        logger.info(f"[REPLACE FILE]   - file_id: {request.file_id} (new upload)")
-        logger.info(f"[REPLACE FILE]   - file_url: {request.file_url}")
-        logger.info(f"[REPLACE FILE]   - table_name: {request.table_name}")
-        logger.info(f"[REPLACE FILE]   - run_background: {request.run_background}")
-        logger.info(f"[REPLACE FILE]   - delete_llm_cache: {request.delete_llm_cache}")
-
+        logger.info(f"[REPLACE FILE] Replacement started: {request.old_file_id} -> {request.file_id}")
+        
+        # Step 1: Soft delete old documents
         try:
-            # ===================================================================
-            # STEP 0: CHECK DUPLICATE - NEW file_id/file_url already exists?
-            # ===================================================================
-            logger.info(f"[REPLACE FILE] Step 0/3: Checking if NEW file_id/file_url already exists...")
-            
-            # Import Milvus check
-            from lightrag.kg.milvus_impl import MilvusVectorDBStorage
-            
-            if not isinstance(rag.chunks_vdb, MilvusVectorDBStorage):
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"replace_file_by_id requires Milvus storage. Current: {type(rag.chunks_vdb).__name__}"
-                )
-            
-            # Check 1: NEW file_id already exists in system?
-            try:
-                existing_doc_ids = await rag.chunks_vdb.get_doc_ids_by_file_id(request.file_id)
-                if existing_doc_ids and len(existing_doc_ids) > 0:
-                    logger.warning(f"[REPLACE FILE] NEW file_id '{request.file_id}' already exists ({len(existing_doc_ids)} docs)")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Cannot replace: NEW file_id='{request.file_id}' already exists with {len(existing_doc_ids)} document(s). Please use a different file_id or delete the existing file first."
-                    )
-            except Exception as e:
-                if "HTTP" in str(type(e).__name__):
-                    raise
-                logger.error(f"[REPLACE FILE] Error checking file_id duplicate: {e}")
-                raise HTTPException(status_code=500, detail=f"Error checking duplicate file_id: {str(e)}")
-            
-            # Check 2: NEW file_url already exists in system?
-            try:
-                existing_doc_ids_url = await rag.chunks_vdb.get_doc_ids_by_file_url(request.file_url)
-                if existing_doc_ids_url and len(existing_doc_ids_url) > 0:
-                    logger.warning(f"[REPLACE FILE] NEW file_url already exists ({len(existing_doc_ids_url)} docs)")
-                    raise HTTPException(
-                        status_code=400,
-                        detail=f"Cannot replace: file_url already exists with {len(existing_doc_ids_url)} document(s). This would create a duplicate."
-                    )
-            except Exception as e:
-                if "HTTP" in str(type(e).__name__):
-                    raise
-                logger.error(f"[REPLACE FILE] Error checking file_url duplicate: {e}")
-                raise HTTPException(status_code=500, detail=f"Error checking duplicate file_url: {str(e)}")
-            
-            logger.info(f"[REPLACE FILE] ✓ No duplicate found, safe to proceed")
-            
-            # ===================================================================
-            # STEP 1: DELETE OLD FILE BY old_file_id
-            # ===================================================================
-            logger.info(f"[REPLACE FILE] Step 1/3: Deleting old documents with old_file_id='{request.old_file_id}'")
-            
-            # Call adelete_by_file_id to remove all old documents
-            deletion_result = await rag.adelete_by_file_id(
-                file_id=request.old_file_id,
-                delete_file=False,  # Don't delete physical file (may not exist for URL uploads)
-                delete_llm_cache=request.delete_llm_cache,
-            )
-            
-            logger.info(f"[REPLACE FILE] Deletion result: {deletion_result['status']}")
-            logger.info(f"[REPLACE FILE] Deleted {len(deletion_result['deleted_docs'])} documents")
-            
-            # Handle case: old_file_id not found
+            deletion_result = await rag.asoft_delete_by_file_id(request.old_file_id)
             if deletion_result["status"] == "not_found":
-                logger.warning(f"[REPLACE FILE] Old_file_id '{request.old_file_id}' not found")
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"No documents found with old_file_id='{request.old_file_id}'. Cannot replace non-existent file."
-                )
-            
-            # Handle case: deletion failed
+                raise HTTPException(status_code=404, detail=f"Old file_id '{request.old_file_id}' not found")
             if deletion_result["status"] == "failure":
-                logger.error(f"[REPLACE FILE] Deletion failed: {deletion_result['message']}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Failed to delete old file: {deletion_result['message']}"
-                )
-            
-            # Log partial success (some documents failed to delete)
-            if deletion_result["status"] == "partial_success":
-                logger.warning(
-                    f"[REPLACE FILE] Partial deletion: {len(deletion_result['deleted_docs'])}/{deletion_result['total_docs']} succeeded"
-                )
-            
-            # ===================================================================
-            # STEP 2: UPLOAD NEW FILE WITH NEW file_id (from request body)
-            # ===================================================================
-            logger.info(f"[REPLACE FILE] Step 2/3: Uploading new file")
-            
-            # Extract filename from URL for processing
-            url_path = request.file_url.rstrip("/")
-            filename = url_path.split("/")[-1]
-            
-            if not filename or "." not in filename:
-                logger.error(f"[REPLACE FILE] Invalid filename from URL: {filename}")
-                raise HTTPException(
-                    status_code=400, 
-                    detail="Cannot extract valid filename from URL"
-                )
-            
-            # Sanitize filename
-            safe_filename = sanitize_filename(filename, doc_manager.input_dir)
-            logger.info(f"[REPLACE FILE] New filename: {safe_filename}")
-            
-            # Validate file type
-            if not doc_manager.is_supported_file(safe_filename):
-                logger.error(f"[REPLACE FILE] Unsupported file type: {safe_filename}")
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Unsupported file type. Supported: {doc_manager.supported_extensions}"
-                )
-            
-            file_path = doc_manager.input_dir / safe_filename
-            
-            # Download new file from URL
-            logger.info(f"[REPLACE FILE] Downloading new file from URL...")
-            downloaded_bytes = 0
-            
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(
-                        request.file_url, 
-                        timeout=aiohttp.ClientTimeout(total=300)
-                    ) as response:
-                        if response.status != 200:
-                            logger.error(f"[REPLACE FILE] Download failed: HTTP {response.status}")
-                            raise HTTPException(
-                                status_code=500,
-                                detail=f"Failed to download new file. HTTP {response.status}: {response.reason}"
-                            )
-                        
-                        # Save file to disk
-                        async with aiofiles.open(file_path, "wb") as f:
-                            async for chunk in response.content.iter_chunked(8192):
-                                await f.write(chunk)
-                                downloaded_bytes += len(chunk)
-                
-                logger.info(f"[REPLACE FILE] Downloaded {downloaded_bytes / 1024:.2f} KB")
-                
-            except aiohttp.ClientError as e:
-                logger.error(f"[REPLACE FILE] Download error: {str(e)}")
-                raise HTTPException(
-                    status_code=500, 
-                    detail=f"Failed to download new file: {str(e)}"
-                )
-            except asyncio.TimeoutError:
-                logger.error(f"[REPLACE FILE] Download timeout")
-                raise HTTPException(
-                    status_code=500, 
-                    detail="New file download timed out (max 300s)"
-                )
-            
-            # Generate new track_id for upload
-            track_id = generate_track_id("replace")
-            logger.info(f"[REPLACE FILE] Generated track_id: {track_id}")
-            
-            # Prepare metadata with NEW file_id (from request body, same as upload_from_url)
-            new_file_id = request.file_id  # NEW file_id provided by frontend
-            logger.info(f"[REPLACE FILE] Using NEW file_id from request: {new_file_id}")
-            logger.info(f"[REPLACE FILE] File ID mapping: {request.old_file_id} (old) → {new_file_id} (new)")
-            
-            custom_metadata = {
-                "file_url": request.file_url,
-                "table_name": request.table_name,
-                "file_id": new_file_id,  # Use NEW file_id from request body
-            }
-            
-            # Process new file (background or synchronous based on flag)
-            if request.run_background:
-                # Background processing
-                logger.info(f"[REPLACE FILE] Adding upload to background tasks")
-                background_tasks.add_task(
-                    pipeline_index_file_with_metadata,
-                    rag,
-                    file_path,
-                    track_id,
-                    custom_metadata,
-                )
-                upload_message = "New file queued for background processing"
-            else:
-                # Synchronous processing
-                logger.info(f"[REPLACE FILE] Processing new file synchronously")
-                try:
-                    await pipeline_index_file_with_metadata(
-                        rag,
-                        file_path,
-                        track_id,
-                        custom_metadata,
-                    )
-                    upload_message = "New file processed successfully"
-                    logger.info(f"[REPLACE FILE] ✓ Synchronous upload completed")
-                except Exception as upload_error:
-                    logger.error(f"[REPLACE FILE] Upload failed: {str(upload_error)}")
-                    raise HTTPException(
-                        status_code=500,
-                        detail=f"New file upload failed: {str(upload_error)}"
-                    )
-            
-            # ===================================================================
-            # STEP 3: RETURN COMBINED RESULT
-            # ===================================================================
-            logger.info(f"[REPLACE FILE] ========== REQUEST COMPLETED ==========")
-            logger.info(f"[REPLACE FILE] Summary:")
-            logger.info(f"[REPLACE FILE]   - Old file_id: {request.old_file_id}")
-            logger.info(f"[REPLACE FILE]   - New file_id: {new_file_id}")
-            logger.info(f"[REPLACE FILE]   - Old docs deleted: {len(deletion_result['deleted_docs'])}")
-            logger.info(f"[REPLACE FILE]   - New file: {safe_filename}")
-            logger.info(f"[REPLACE FILE]   - Track ID: {track_id}")
-            
-            return {
-                "status": "success",
-                "old_file_id": request.old_file_id,  # Return old file_id for tracking
-                "new_file_id": new_file_id,          # Return new file_id for frontend update
-                "deletion_result": {
-                    "status": deletion_result["status"],
-                    "total_docs": deletion_result["total_docs"],
-                    "deleted_count": len(deletion_result["deleted_docs"]),
-                    "failed_count": len(deletion_result["failed_docs"]),
-                },
-                "upload_result": {
-                    "filename": safe_filename,
-                    "size_kb": downloaded_bytes / 1024,
-                    "message": upload_message,
-                },
-                "message": f"Successfully deleted old file_id='{request.old_file_id}' ({len(deletion_result['deleted_docs'])} docs) and uploaded new file with file_id='{new_file_id}'",
-                "track_id": track_id,
-            }
-
-        except HTTPException:
-            # Re-raise HTTP exceptions (already logged)
-            raise
+                raise HTTPException(status_code=500, detail=f"Failed to delete old file: {deletion_result['message']}")
+        except HTTPException: raise
         except Exception as e:
-            # Handle unexpected errors
-            logger.error(f"[REPLACE FILE] ❌ UNEXPECTED ERROR: {str(e)}")
-            logger.error(traceback.format_exc())
-            raise HTTPException(status_code=500, detail=str(e))
+            logger.error(f"[REPLACE FILE] Error deleting old file: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Error deleting old file: {str(e)}")
+
+        # Step 2: Upload new file using helper (same logic as upload_from_url)
+        upload_resp = await _internal_upload_from_url(
+            file_url=request.file_url,
+            table_name=request.table_name,
+            file_id=request.file_id,
+            run_background=request.run_background,
+            background_tasks=background_tasks,
+        )
+
+        return {
+            "status": "success",
+            "old_file_id": request.old_file_id,
+            "new_file_id": request.file_id,
+            "deletion_result": deletion_result,
+            "upload_result": {
+                "status": upload_resp.status,
+                "message": upload_resp.message,
+                "track_id": upload_resp.track_id
+            },
+            "message": f"Successfully soft-deleted '{request.old_file_id}' and processed new upload for '{request.file_id}'",
+            "track_id": upload_resp.track_id
+        }
 
     @router.post(
         "/cancel_pipeline",
