@@ -230,12 +230,12 @@ class OllamaAPI:
         # Create combined auth dependency for Ollama API routes
         combined_auth = get_combined_auth_dependency(self.api_key)
 
-        @self.router.get("/version", dependencies=[Depends(combined_auth)])
+        @self.router.get("/version", dependencies=[Depends(combined_auth)], include_in_schema=False)
         async def get_version():
             """Get Ollama version information"""
             return OllamaVersionResponse(version="0.9.3")
 
-        @self.router.get("/tags", dependencies=[Depends(combined_auth)])
+        @self.router.get("/tags", dependencies=[Depends(combined_auth)], include_in_schema=False)
         async def get_tags():
             """Return available models acting as an Ollama server"""
             return OllamaTagResponse(
@@ -258,7 +258,7 @@ class OllamaAPI:
                 ]
             )
 
-        @self.router.get("/ps", dependencies=[Depends(combined_auth)])
+        @self.router.get("/ps", dependencies=[Depends(combined_auth)], include_in_schema=False)
         async def get_running_models():
             """List Running Models - returns currently running models"""
             return OllamaPsResponse(
@@ -283,7 +283,7 @@ class OllamaAPI:
             )
 
         @self.router.post(
-            "/generate", dependencies=[Depends(combined_auth)], include_in_schema=True
+            "/generate", dependencies=[Depends(combined_auth)], include_in_schema=False
         )
         async def generate(raw_request: Request):
             """Handle generate completion requests acting as an Ollama model
@@ -460,7 +460,7 @@ class OllamaAPI:
                 raise HTTPException(status_code=500, detail=str(e))
 
         @self.router.post(
-            "/chat", dependencies=[Depends(combined_auth)], include_in_schema=True
+            "/chat", dependencies=[Depends(combined_auth)], include_in_schema=False
         )
         async def chat(raw_request: Request):
             """Process chat completion requests by acting as an Ollama model.

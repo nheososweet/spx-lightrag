@@ -202,6 +202,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         "/query",
         response_model=QueryResponse,
         dependencies=[Depends(combined_auth)],
+        include_in_schema=False,
         responses={
             200: {
                 "description": "Successful RAG query response",
@@ -461,6 +462,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
     @router.post(
         "/query/stream",
         dependencies=[Depends(combined_auth)],
+        include_in_schema=False,
         responses={
             200: {
                 "description": "Flexible RAG query response - format depends on stream parameter",

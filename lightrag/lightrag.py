@@ -4803,7 +4803,19 @@ class LightRAG:
                     status = "failure"
                     message = f"Failed to soft delete any documents with table_name='{table_name}'"
                 
-                logger.info(f"[SOFT DELETE BY TABLE] {message}")
+                # Step 4: Persist changes to disk immediately after batch operation
+                storages_to_persist = [
+                    self.doc_status,
+                    self.full_docs,
+                    self.text_chunks,
+                    self.entity_chunks,
+                    self.relation_chunks,
+                    self.chunk_entity_relation_graph
+                ]
+                for storage in storages_to_persist:
+                    if storage and hasattr(storage, "index_done_callback"):
+                        await storage.index_done_callback()
+
                 return {
                     "status": status,
                     "table_name": table_name,
@@ -4976,7 +4988,19 @@ class LightRAG:
                     status = "failure"
                     message = f"Failed to soft delete any documents with file_id='{file_id}'"
                 
-                logger.info(f"[SOFT DELETE BY FILE_ID] {message}")
+                # Step 4: Persist changes to disk immediately after batch operation
+                storages_to_persist = [
+                    self.doc_status,
+                    self.full_docs,
+                    self.text_chunks,
+                    self.entity_chunks,
+                    self.relation_chunks,
+                    self.chunk_entity_relation_graph
+                ]
+                for storage in storages_to_persist:
+                    if storage and hasattr(storage, "index_done_callback"):
+                        await storage.index_done_callback()
+
                 return {
                     "status": status,
                     "file_id": file_id,
@@ -5060,9 +5084,8 @@ class LightRAG:
             # I need to verify this. For now let's assume I might need to fix that too.
             
             logger.info(f"[REACTIVATE BY FILE_ID] Querying documents with file_id='{file_id}'")
-            # We assume this method returns ALL docs matching file_id regardless of isDeleted status
-            # unless it explicitly filters isDeleted=False.
-            doc_ids = await self.chunks_vdb.get_doc_ids_by_file_id(file_id)
+            # We must include deleted documents to be able to reactivate them
+            doc_ids = await self.chunks_vdb.get_doc_ids_by_file_id(file_id, include_deleted=True)
 
             if not doc_ids:
                 logger.info(f"[REACTIVATE BY FILE_ID] No documents found with file_id='{file_id}'")
@@ -5161,7 +5184,19 @@ class LightRAG:
                     status = "failure"
                     message = f"Failed to reactivate any documents with file_id='{file_id}'"
                 
-                logger.info(f"[REACTIVATE BY FILE_ID] {message}")
+                # Step 4: Persist changes to disk immediately after batch operation
+                storages_to_persist = [
+                    self.doc_status,
+                    self.full_docs,
+                    self.text_chunks,
+                    self.entity_chunks,
+                    self.relation_chunks,
+                    self.chunk_entity_relation_graph
+                ]
+                for storage in storages_to_persist:
+                    if storage and hasattr(storage, "index_done_callback"):
+                        await storage.index_done_callback()
+
                 return {
                     "status": status,
                     "file_id": file_id,

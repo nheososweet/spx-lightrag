@@ -2887,7 +2887,7 @@ def create_document_routes(
     combined_auth = get_combined_auth_dependency(api_key)
 
     @router.post(
-        "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
+        "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)], include_in_schema=False
     )
     async def scan_for_new_documents(background_tasks: BackgroundTasks):
         """
@@ -2912,7 +2912,7 @@ def create_document_routes(
         )
 
     @router.post(
-        "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
+        "/upload", response_model=InsertResponse, dependencies=[Depends(combined_auth)], include_in_schema=False
     )
     async def upload_to_input_dir(
         background_tasks: BackgroundTasks, file: UploadFile = File(...)
@@ -3309,7 +3309,7 @@ def create_document_routes(
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.post(
-        "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
+        "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)], include_in_schema=False
     )
     async def insert_text(
         request: InsertTextRequest, background_tasks: BackgroundTasks
@@ -3403,6 +3403,7 @@ def create_document_routes(
         "/texts",
         response_model=InsertResponse,
         dependencies=[Depends(combined_auth)],
+        include_in_schema=False
     )
     async def insert_texts(
         request: InsertTextsRequest, background_tasks: BackgroundTasks
@@ -3483,7 +3484,7 @@ def create_document_routes(
             raise HTTPException(status_code=500, detail=str(e))
 
     @router.delete(
-        "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
+        "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)], include_in_schema=False
     )
     async def clear_documents():
         """
@@ -3680,6 +3681,7 @@ def create_document_routes(
         "/pipeline_status",
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
+        include_in_schema=False
     )
     async def get_pipeline_status() -> PipelineStatusResponse:
         """
@@ -3891,6 +3893,7 @@ def create_document_routes(
         "/delete_document",
         response_model=DeleteDocByIdResponse,
         dependencies=[Depends(combined_auth)],
+        include_in_schema=False,
         summary="Delete a document and all its associated data by its ID.",
     )
     async def delete_document(
@@ -3970,6 +3973,7 @@ def create_document_routes(
         "/delete_by_table_name",
         response_model=DeleteByTableNameResponse,
         dependencies=[Depends(combined_auth)],
+        include_in_schema=False,
         summary="Delete all documents with a specific table_name in Milvus dynamic fields.",
     )
     async def delete_by_table_name(
@@ -4085,6 +4089,7 @@ def create_document_routes(
         "/delete_by_file_id",
         response_model=DeleteByFileIdResponse,
         dependencies=[Depends(combined_auth)],
+        include_in_schema=False,
         summary="Delete all documents with a specific file_id in Milvus dynamic fields.",
     )
     async def delete_by_file_id(
@@ -4414,6 +4419,7 @@ def create_document_routes(
         "/active_by_file_id",
         response_model=DeleteByFileIdResponse, # Reuse response model as structure is same
         dependencies=[Depends(combined_auth)],
+        include_in_schema=False,
         summary="Reactivate all documents with a specific file_id.",
     )
     async def active_by_file_id(
@@ -4479,6 +4485,7 @@ def create_document_routes(
     @router.post(
         "/clear_cache",
         response_model=ClearCacheResponse,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def clear_cache(request: ClearCacheRequest):
@@ -4513,6 +4520,7 @@ def create_document_routes(
     @router.delete(
         "/delete_entity",
         response_model=DeletionResult,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def delete_entity(request: DeleteEntityRequest):
@@ -4548,6 +4556,7 @@ def create_document_routes(
     @router.delete(
         "/delete_relation",
         response_model=DeletionResult,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def delete_relation(request: DeleteRelationRequest):
@@ -4586,6 +4595,7 @@ def create_document_routes(
     @router.get(
         "/track_status/{track_id}",
         response_model=TrackStatusResponse,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def get_track_status(track_id: str) -> TrackStatusResponse:
@@ -4660,6 +4670,7 @@ def create_document_routes(
     @router.post(
         "/paginated",
         response_model=PaginatedDocsResponse,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def get_documents_paginated(
@@ -4747,6 +4758,7 @@ def create_document_routes(
     @router.get(
         "/status_counts",
         response_model=StatusCountsResponse,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def get_document_status_counts() -> StatusCountsResponse:
@@ -4774,6 +4786,7 @@ def create_document_routes(
     @router.post(
         "/reprocess_failed",
         response_model=ReprocessResponse,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def reprocess_failed_documents(background_tasks: BackgroundTasks):
@@ -5134,6 +5147,7 @@ def create_document_routes(
     @router.post(
         "/cancel_pipeline",
         response_model=CancelPipelineResponse,
+        include_in_schema=False,
         dependencies=[Depends(combined_auth)],
     )
     async def cancel_pipeline():

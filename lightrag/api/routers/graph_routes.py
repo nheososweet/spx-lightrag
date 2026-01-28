@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from lightrag.utils import logger
 from ..utils_api import get_combined_auth_dependency
 
-router = APIRouter(tags=["graph"])
+router = APIRouter(tags=["graph"], include_in_schema=False)
 
 
 class EntityUpdateRequest(BaseModel):
