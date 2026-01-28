@@ -221,6 +221,12 @@ class InsertTextRequest(BaseModel):
         description="The text to insert",
     )
     file_source: str = Field(default=None, min_length=0, description="File Source")
+    file_id: Optional[str] = Field(default=None, description="Unique identifier for the file")
+    table_name: Optional[str] = Field(default=None, description="Table name for categorizing the document")
+    run_background: bool = Field(
+        default=True,
+        description="If True, process in background and return immediately. If False, wait for processing to complete.",
+    )
 
     @field_validator("text", mode="after")
     @classmethod
@@ -237,6 +243,9 @@ class InsertTextRequest(BaseModel):
             "example": {
                 "text": "This is a sample text to be inserted into the RAG system.",
                 "file_source": "Source of the text (optional)",
+                "file_id": "file_123",
+                "table_name": "documents",
+                "run_background": True,
             }
         }
 
@@ -377,6 +386,12 @@ class InsertTextsRequest(BaseModel):
     file_sources: list[str] = Field(
         default=None, min_length=0, description="Sources of the texts"
     )
+    file_id: Optional[str] = Field(default=None, description="Unique identifier for the files")
+    table_name: Optional[str] = Field(default=None, description="Table name for categorizing the documents")
+    run_background: bool = Field(
+        default=True,
+        description="If True, process in background and return immediately. If False, wait for processing to complete.",
+    )
 
     @field_validator("texts", mode="after")
     @classmethod
@@ -398,6 +413,9 @@ class InsertTextsRequest(BaseModel):
                 "file_sources": [
                     "First file source (optional)",
                 ],
+                "file_id": "batch_123",
+                "table_name": "documents",
+                "run_background": True,
             }
         }
 
@@ -2281,6 +2299,7 @@ async def pipeline_index_file_with_metadata(
                 chunk["file_url"] = custom_metadata.get("file_url", "")
                 chunk["table_name"] = custom_metadata.get("table_name", "")
                 chunk["file_id"] = custom_metadata.get("file_id", "")
+                chunk["isDeleted"] = False
                 
                 # Inject page numbers
                 if pages_info_for_tracking and full_text_for_tracking:
@@ -2474,6 +2493,69 @@ async def pipeline_index_texts(
         input=texts, file_paths=file_sources, track_id=track_id
     )
     await rag.apipeline_process_enqueue_documents()
+
+
+async def pipeline_index_texts_with_metadata(
+    rag: LightRAG,
+    texts: List[str],
+    file_sources: List[str],
+    track_id: str,
+    custom_metadata: Dict[str, str],
+):
+    """Index texts with custom metadata injection into Milvus Dynamic Fields
+
+    Args:
+        rag: LightRAG instance
+        texts: List of text contents
+        file_sources: Sources of the texts
+        track_id: Tracking ID for monitoring progress
+        custom_metadata: Dict containing table_name, file_id
+    """
+    logger.info(f"[METADATA PIPELINE] Starting processing for {len(texts)} texts")
+    logger.info(f"[METADATA PIPELINE] Track ID: {track_id}")
+    logger.info(f"[METADATA PIPELINE] Custom metadata: {custom_metadata}")
+
+    # Save original chunking function
+    original_chunking_func = rag.chunking_func
+
+    def chunking_with_metadata(
+        tokenizer,
+        content: str,
+        split_by_character: str = None,
+        split_by_character_only: bool = False,
+        chunk_overlap_token_size: int = 100,
+        chunk_token_size: int = 1200,
+    ):
+        """Wrapper chunking function that adds custom metadata to each chunk"""
+        chunks = original_chunking_func(
+            tokenizer,
+            content,
+            split_by_character,
+            split_by_character_only,
+            chunk_overlap_token_size,
+            chunk_token_size,
+        )
+
+        for chunk in chunks:
+            chunk["table_name"] = custom_metadata.get("table_name", "")
+            chunk["file_id"] = custom_metadata.get("file_id", "")
+            chunk["isDeleted"] = False
+
+        return chunks
+
+    # Temporarily replace chunking function
+    rag.chunking_func = chunking_with_metadata
+
+    try:
+        # Enqueue and process
+        await rag.apipeline_enqueue_documents(
+            input=texts, file_paths=file_sources, track_id=track_id
+        )
+        await rag.apipeline_process_enqueue_documents()
+        logger.info(f"[METADATA PIPELINE] Processed {len(texts)} texts with metadata")
+    finally:
+        # Restore original chunking function
+        rag.chunking_func = original_chunking_func
 
 
 async def run_scanning_process(
@@ -3197,7 +3279,7 @@ def create_document_routes(
         )
 
     @router.post(
-        "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)], include_in_schema=False
+        "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def insert_text(
         request: InsertTextRequest, background_tasks: BackgroundTasks
@@ -3229,12 +3311,14 @@ def create_document_routes(
                     request.file_source, include_deleted=True
                 )
                 if existing_doc_data:
-                     # Check if it's soft-deleted
+                    # Check if it's soft-deleted
                     if existing_doc_data.get("isDeleted", False):
-                         # Reactivate instead of re-ingesting
+                        # Reactivate instead of re-ingesting
                         doc_id = existing_doc_data.get("id")
                         if doc_id:
-                            logger.info(f"[TEXT INSERT] Found soft-deleted source '{request.file_source}' (doc_id: {doc_id}). Reactivating...")
+                            logger.info(
+                                f"[TEXT INSERT] Found soft-deleted source '{request.file_source}' (doc_id: {doc_id}). Reactivating..."
+                            )
                             await rag.aactive_by_doc_id(doc_id)
                             return InsertResponse(
                                 status="success",
@@ -3244,7 +3328,6 @@ def create_document_routes(
 
                     # Get document status and track_id from existing document
                     status = existing_doc_data.get("status", "unknown")
-                    # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
                     existing_track_id = existing_doc_data.get("track_id") or ""
                     return InsertResponse(
                         status="duplicated",
@@ -3255,8 +3338,22 @@ def create_document_routes(
             # Check if content already exists by computing content hash (doc_id)
             sanitized_text = sanitize_text_for_encoding(request.text)
             content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
-            existing_doc = await rag.doc_status.get_by_id(content_doc_id)
+            existing_doc = await rag.doc_status.get_by_id(
+                content_doc_id, include_deleted=True
+            )
             if existing_doc:
+                # Check if it's soft-deleted
+                if existing_doc.get("isDeleted", False):
+                    logger.info(
+                        f"[TEXT INSERT] Found soft-deleted content (doc_id: {content_doc_id}). Reactivating..."
+                    )
+                    await rag.aactive_by_doc_id(content_doc_id)
+                    return InsertResponse(
+                        status="success",
+                        message="Identical content was previously deleted and has been restored.",
+                        track_id=existing_doc.get("track_id") or "",
+                    )
+
                 # Content already exists, return duplicated with existing track_id
                 status = existing_doc.get("status", "unknown")
                 existing_track_id = existing_doc.get("track_id") or ""
@@ -3268,18 +3365,34 @@ def create_document_routes(
 
             # Generate track_id for text insertion
             track_id = generate_track_id("insert")
+            custom_metadata = {
+                "table_name": request.table_name,
+                "file_id": request.file_id,
+            }
 
-            background_tasks.add_task(
-                pipeline_index_texts,
-                rag,
-                [request.text],
-                file_sources=[request.file_source],
-                track_id=track_id,
-            )
+            if request.run_background:
+                background_tasks.add_task(
+                    pipeline_index_texts_with_metadata,
+                    rag,
+                    [request.text],
+                    file_sources=[request.file_source],
+                    track_id=track_id,
+                    custom_metadata=custom_metadata,
+                )
+                message = "Text successfully received. Processing will continue in background."
+            else:
+                await pipeline_index_texts_with_metadata(
+                    rag,
+                    [request.text],
+                    file_sources=[request.file_source],
+                    track_id=track_id,
+                    custom_metadata=custom_metadata,
+                )
+                message = "Text processed successfully."
 
             return InsertResponse(
                 status="success",
-                message="Text successfully received. Processing will continue in background.",
+                message=message,
                 track_id=track_id,
             )
         except Exception as e:
@@ -3291,7 +3404,6 @@ def create_document_routes(
         "/texts",
         response_model=InsertResponse,
         dependencies=[Depends(combined_auth)],
-        include_in_schema=False
     )
     async def insert_texts(
         request: InsertTextsRequest, background_tasks: BackgroundTasks
@@ -3322,12 +3434,26 @@ def create_document_routes(
                         and file_source != "unknown_source"
                     ):
                         existing_doc_data = await rag.doc_status.get_doc_by_file_path(
-                            file_source
+                            file_source, include_deleted=True
                         )
                         if existing_doc_data:
+                            # Check if it's soft-deleted
+                            if existing_doc_data.get("isDeleted", False):
+                                doc_id = existing_doc_data.get("id")
+                                if doc_id:
+                                    logger.info(
+                                        f"[TEXTS INSERT] Found soft-deleted source '{file_source}' (doc_id: {doc_id}). Reactivating..."
+                                    )
+                                    await rag.aactive_by_doc_id(doc_id)
+                                    return InsertResponse(
+                                        status="success",
+                                        message=f"File source '{file_source}' was previously deleted and has been restored.",
+                                        track_id=existing_doc_data.get("track_id")
+                                        or "",
+                                    )
+
                             # Get document status and track_id from existing document
                             status = existing_doc_data.get("status", "unknown")
-                            # Use `or ""` to handle both missing key and None value (e.g., legacy rows without track_id)
                             existing_track_id = existing_doc_data.get("track_id") or ""
                             return InsertResponse(
                                 status="duplicated",
@@ -3339,8 +3465,22 @@ def create_document_routes(
             for text in request.texts:
                 sanitized_text = sanitize_text_for_encoding(text)
                 content_doc_id = compute_mdhash_id(sanitized_text, prefix="doc-")
-                existing_doc = await rag.doc_status.get_by_id(content_doc_id)
+                existing_doc = await rag.doc_status.get_by_id(
+                    content_doc_id, include_deleted=True
+                )
                 if existing_doc:
+                    # Check if it's soft-deleted
+                    if existing_doc.get("isDeleted", False):
+                        logger.info(
+                            f"[TEXTS INSERT] Found soft-deleted content (doc_id: {content_doc_id}). Reactivating..."
+                        )
+                        await rag.aactive_by_doc_id(content_doc_id)
+                        return InsertResponse(
+                            status="success",
+                            message="One of the texts was previously deleted and has been restored.",
+                            track_id=existing_doc.get("track_id") or "",
+                        )
+
                     # Content already exists, return duplicated with existing track_id
                     status = existing_doc.get("status", "unknown")
                     existing_track_id = existing_doc.get("track_id") or ""
@@ -3352,18 +3492,34 @@ def create_document_routes(
 
             # Generate track_id for texts insertion
             track_id = generate_track_id("insert")
+            custom_metadata = {
+                "table_name": request.table_name,
+                "file_id": request.file_id,
+            }
 
-            background_tasks.add_task(
-                pipeline_index_texts,
-                rag,
-                request.texts,
-                file_sources=request.file_sources,
-                track_id=track_id,
-            )
+            if request.run_background:
+                background_tasks.add_task(
+                    pipeline_index_texts_with_metadata,
+                    rag,
+                    request.texts,
+                    file_sources=request.file_sources,
+                    track_id=track_id,
+                    custom_metadata=custom_metadata,
+                )
+                message = "Texts successfully received. Processing will continue in background."
+            else:
+                await pipeline_index_texts_with_metadata(
+                    rag,
+                    request.texts,
+                    file_sources=request.file_sources,
+                    track_id=track_id,
+                    custom_metadata=custom_metadata,
+                )
+                message = "Texts processed successfully."
 
             return InsertResponse(
                 status="success",
-                message="Texts successfully received. Processing will continue in background.",
+                message=message,
                 track_id=track_id,
             )
         except Exception as e:

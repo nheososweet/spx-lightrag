@@ -384,11 +384,11 @@ class BaseKVStorage(StorageNameSpace, ABC):
     embedding_func: EmbeddingFunc
 
     @abstractmethod
-    async def get_by_id(self, id: str) -> dict[str, Any] | None:
+    async def get_by_id(self, id: str, include_deleted: bool = False) -> dict[str, Any] | None:
         """Get value by id"""
 
     @abstractmethod
-    async def get_by_ids(self, ids: list[str]) -> list[dict[str, Any]]:
+    async def get_by_ids(self, ids: list[str], include_deleted: bool = False) -> list[dict[str, Any]]:
         """Get values by ids"""
 
     @abstractmethod

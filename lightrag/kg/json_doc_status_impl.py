@@ -234,9 +234,12 @@ class JsonDocStatusStorage(DocStatusStorage):
         async with self._storage_lock:
             return len(self._data) == 0
 
-    async def get_by_id(self, id: str) -> Union[dict[str, Any], None]:
+    async def get_by_id(self, id: str, include_deleted: bool = False) -> Union[dict[str, Any], None]:
         async with self._storage_lock:
-            return self._data.get(id)
+            data = self._data.get(id)
+            if data and not include_deleted and data.get("isDeleted", False):
+                return None
+            return data
 
     async def get_docs_paginated(
         self,
@@ -291,7 +294,7 @@ class JsonDocStatusStorage(DocStatusStorage):
                     # Prepare document data
                     data = doc_data.copy()
                     data.pop("content", None)
-                    if "file_path" not in data:
+                    if data.get("file_path") is None:
                         data["file_path"] = "no-file-path"
                     if "metadata" not in data:
                         data["metadata"] = {}
