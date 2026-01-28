@@ -213,14 +213,24 @@ class InsertTextRequest(BaseModel):
 
     Attributes:
         text: The text content to be inserted into the RAG system
-        file_source: Source of the text (optional)
+        file_source: Source identifier (defaults to "paragraph" if empty)
+        table_name: Table/category name for organizing documents (required)
     """
 
     text: str = Field(
         min_length=1,
         description="The text to insert",
     )
-    file_source: str = Field(default=None, min_length=0, description="File Source")
+    file_source: str = Field(
+        default="paragraph",
+        min_length=0,
+        description="File Source identifier (defaults to 'paragraph' if empty)",
+    )
+    table_name: str = Field(
+        ...,
+        min_length=1,
+        description="Table name for categorizing the document",
+    )
 
     @field_validator("text", mode="after")
     @classmethod
@@ -229,14 +239,26 @@ class InsertTextRequest(BaseModel):
 
     @field_validator("file_source", mode="after")
     @classmethod
-    def strip_source_after(cls, file_source: str) -> str:
-        return file_source.strip()
+    def set_default_file_source(cls, file_source: str) -> str:
+        """Set default to 'paragraph' if empty"""
+        file_source = file_source.strip() if file_source else ""
+        return file_source or "paragraph"
+
+    @field_validator("table_name", mode="after")
+    @classmethod
+    def validate_table_name(cls, table_name: str) -> str:
+        """Validate table_name is not empty"""
+        table_name = table_name.strip()
+        if not table_name:
+            raise ValueError("table_name cannot be empty")
+        return table_name
 
     class Config:
         json_schema_extra = {
             "example": {
                 "text": "This is a sample text to be inserted into the RAG system.",
-                "file_source": "Source of the text (optional)",
+                "file_source": "manual_input",
+                "table_name": "user_documents",
             }
         }
 
@@ -2476,6 +2498,141 @@ async def pipeline_index_texts(
     await rag.apipeline_process_enqueue_documents()
 
 
+async def pipeline_index_texts_with_metadata(
+    rag: LightRAG,
+    texts: List[str],
+    file_sources: List[str] = None,
+    custom_metadata_list: List[Dict[str, str]] = None,
+    track_id: str = None,
+):
+    """Index texts with custom metadata injection into Milvus Dynamic Fields
+    
+    Similar to pipeline_index_file_with_metadata but for direct text insertion.
+    Injects custom metadata (table_name, isDeleted) into each chunk created from the text.
+    
+    Args:
+        rag: LightRAG instance
+        texts: List of text strings to index
+        file_sources: List of source identifiers (will be stored as file_path in chunks)
+        custom_metadata_list: List of metadata dicts, one per text
+            Each dict should contain: {"table_name": str}
+        track_id: Tracking ID for monitoring progress
+    
+    Workflow:
+        1. Validate inputs and set defaults
+        2. Save original chunking function
+        3. Create wrapper function that injects metadata into chunks
+        4. For each text:
+           a. Set current metadata context
+           b. Enqueue document
+        5. Process all enqueued documents (which will use the wrapper chunking)
+        6. Restore original chunking function
+    """
+    if not texts:
+        logger.warning("[METADATA TEXT PIPELINE] No texts provided, skipping")
+        return
+    
+    # Validate and set defaults for file_sources
+    if file_sources is None:
+        file_sources = ["paragraph"] * len(texts)
+    elif len(file_sources) != len(texts):
+        raise ValueError(
+            f"Length of file_sources ({len(file_sources)}) must match texts ({len(texts)})"
+        )
+    
+    # Validate and set defaults for custom_metadata_list
+    if custom_metadata_list is None:
+        custom_metadata_list = [{}] * len(texts)
+    elif len(custom_metadata_list) != len(texts):
+        raise ValueError(
+            f"Length of custom_metadata_list ({len(custom_metadata_list)}) must match texts ({len(texts)})"
+        )
+    
+    logger.info(f"[METADATA TEXT PIPELINE] Processing {len(texts)} texts with metadata injection")
+    
+    # Save original chunking function
+    original_chunking_func = rag.chunking_func
+    logger.debug(f"[METADATA TEXT PIPELINE] Saved original chunking func: {original_chunking_func.__name__}")
+    
+    # Create wrapper that injects metadata
+    def chunking_with_metadata(
+        tokenizer,
+        content: str,
+        split_by_character: str = None,
+        split_by_character_only: bool = False,
+        chunk_overlap_token_size: int = 100,
+        chunk_token_size: int = 1200,
+    ):
+        """Wrapper chunking function that adds custom metadata to each chunk"""
+        # Call original chunking function
+        chunks = original_chunking_func(
+            tokenizer,
+            content,
+            split_by_character,
+            split_by_character_only,
+            chunk_overlap_token_size,
+            chunk_token_size,
+        )
+        
+        # Get metadata for current text being processed (from closure variable)
+        current_metadata = getattr(chunking_with_metadata, 'current_metadata', {})
+        
+        # Inject metadata into each chunk
+        for chunk in chunks:
+            # Add table_name from custom metadata
+            chunk["table_name"] = current_metadata.get("table_name", "")
+            # Add isDeleted flag for soft delete support (default False for new chunks)
+            chunk["isDeleted"] = False
+        
+        logger.debug(
+            f"[METADATA TEXT PIPELINE] Injected metadata into {len(chunks)} chunks: "
+            f"table_name={current_metadata.get('table_name', 'N/A')}"
+        )
+        
+        return chunks
+    
+    try:
+        # Temporarily replace chunking function
+        logger.info("[METADATA TEXT PIPELINE] Replacing chunking function with metadata wrapper")
+        rag.chunking_func = chunking_with_metadata
+        
+        # Process each text with its metadata
+        for i, (text, file_source, custom_metadata) in enumerate(
+            zip(texts, file_sources, custom_metadata_list), 1
+        ):
+            # Set current metadata for the wrapper to use (closure variable)
+            chunking_with_metadata.current_metadata = custom_metadata
+            
+            logger.info(
+                f"[METADATA TEXT PIPELINE] Enqueueing text {i}/{len(texts)}: "
+                f"file_source={file_source}, table_name={custom_metadata.get('table_name', 'N/A')}"
+            )
+            
+            # Enqueue single text (chunking will happen later during processing)
+            await rag.apipeline_enqueue_documents(
+                input=[text],
+                file_paths=[file_source],
+                track_id=track_id
+            )
+        
+        logger.info(f"[METADATA TEXT PIPELINE] Enqueued {len(texts)} texts, starting processing...")
+        
+        # Process all enqueued documents (this is when chunking happens)
+        await rag.apipeline_process_enqueue_documents()
+        
+        logger.info("[METADATA TEXT PIPELINE] ✅ Processing completed successfully")
+        
+    except Exception as e:
+        logger.error(f"[METADATA TEXT PIPELINE] ❌ Error during processing: {e}")
+        logger.error(traceback.format_exc())
+        raise
+    finally:
+        # CRITICAL: Always restore original chunking function
+        logger.info("[METADATA TEXT PIPELINE] Restoring original chunking function")
+        rag.chunking_func = original_chunking_func
+
+
+
 async def run_scanning_process(
     rag: LightRAG, doc_manager: DocumentManager, track_id: str = None
 ):
@@ -3269,11 +3426,18 @@ def create_document_routes(
             # Generate track_id for text insertion
             track_id = generate_track_id("insert")
 
+            # Prepare custom metadata for injection into chunks
+            custom_metadata = {
+                "table_name": request.table_name,
+            }
+
+            # Use new pipeline function with metadata injection
             background_tasks.add_task(
-                pipeline_index_texts,
+                pipeline_index_texts_with_metadata,
                 rag,
                 [request.text],
                 file_sources=[request.file_source],
+                custom_metadata_list=[custom_metadata],
                 track_id=track_id,
             )
 
