@@ -1527,7 +1527,7 @@ def _extract_xlsx(file_bytes: bytes) -> str:
 
 async def pipeline_enqueue_file(
     rag: LightRAG, file_path: Path, track_id: str = None
-) -> tuple[bool, str]:
+) -> tuple[bool, str, Optional[Path]]:
     """Add a file to the queue for processing
 
     Args:
@@ -1535,7 +1535,7 @@ async def pipeline_enqueue_file(
         file_path: Path to the saved file
         track_id: Optional tracking ID, if not provided will be generated
     Returns:
-        tuple: (success: bool, track_id: str)
+        tuple: (success: bool, track_id: str, final_path: Path | None)
     """
 
     # Generate track_id if not provided
@@ -1570,7 +1570,7 @@ async def pipeline_enqueue_file(
             logger.error(
                 f"[File Extraction]Permission denied reading file: {file_path.name}"
             )
-            return False, track_id
+            return False, track_id, None
         except FileNotFoundError as e:
             error_files = [
                 {
@@ -1582,7 +1582,7 @@ async def pipeline_enqueue_file(
             ]
             await rag.apipeline_enqueue_error_documents(error_files, track_id)
             logger.error(f"[File Extraction]File not found: {file_path.name}")
-            return False, track_id
+            return False, track_id, None
         except Exception as e:
             error_files = [
                 {
@@ -1596,7 +1596,7 @@ async def pipeline_enqueue_file(
             logger.error(
                 f"[File Extraction]Error reading file {file_path.name}: {str(e)}"
             )
-            return False, track_id
+            return False, track_id, None
 
         # Process based on file type
         try:
@@ -1657,7 +1657,7 @@ async def pipeline_enqueue_file(
                             logger.error(
                                 f"[File Extraction]Empty content in file: {file_path.name}"
                             )
-                            return False, track_id
+                            return False, track_id, None
 
                         # Check if content looks like binary data string representation
                         if content.startswith("b'") or content.startswith('b"'):
@@ -1675,7 +1675,7 @@ async def pipeline_enqueue_file(
                             logger.error(
                                 f"[File Extraction]File {file_path.name} appears to contain binary data representation instead of text"
                             )
-                            return False, track_id
+                            return False, track_id, None
 
                     except UnicodeDecodeError as e:
                         error_files = [
@@ -1692,7 +1692,7 @@ async def pipeline_enqueue_file(
                         logger.error(
                             f"[File Extraction]File {file_path.name} is not valid UTF-8 encoded text. Please convert it to UTF-8 before processing."
                         )
-                        return False, track_id
+                        return False, track_id, None
 
                 case ".pdf":
                     try:
@@ -1733,7 +1733,7 @@ async def pipeline_enqueue_file(
                         logger.error(
                             f"[File Extraction]Error processing PDF {file_path.name}: {str(e)}"
                         )
-                        return False, track_id
+                        return False, track_id, None
 
                 case ".docx":
                     try:
@@ -1770,7 +1770,7 @@ async def pipeline_enqueue_file(
                         logger.error(
                             f"[File Extraction]Error processing DOCX {file_path.name}: {str(e)}"
                         )
-                        return False, track_id
+                        return False, track_id, None
 
                 case ".pptx":
                     try:
@@ -1807,7 +1807,7 @@ async def pipeline_enqueue_file(
                         logger.error(
                             f"[File Extraction]Error processing PPTX {file_path.name}: {str(e)}"
                         )
-                        return False, track_id
+                        return False, track_id, None
 
                 case ".xlsx":
                     try:
@@ -1844,7 +1844,7 @@ async def pipeline_enqueue_file(
                         logger.error(
                             f"[File Extraction]Error processing XLSX {file_path.name}: {str(e)}"
                         )
-                        return False, track_id
+                        return False, track_id, None
 
                 case _:
                     error_files = [
@@ -1859,7 +1859,7 @@ async def pipeline_enqueue_file(
                     logger.error(
                         f"[File Extraction]Unsupported file type: {file_path.name} (extension {ext})"
                     )
-                    return False, track_id
+                    return False, track_id, None
 
         except Exception as e:
             error_files = [
@@ -1874,7 +1874,7 @@ async def pipeline_enqueue_file(
             logger.error(
                 f"[File Extraction]Unexpected error during {file_path.name} extracting: {str(e)}"
             )
-            return False, track_id
+            return False, track_id, None
 
         # Insert into the RAG queue
         if content:
@@ -1892,7 +1892,7 @@ async def pipeline_enqueue_file(
                 logger.warning(
                     f"[File Extraction]File contains only whitespace characters: {file_path.name}"
                 )
-                return False, track_id
+                return False, track_id, None
 
             try:
                 await rag.apipeline_enqueue_documents(
@@ -1904,6 +1904,7 @@ async def pipeline_enqueue_file(
                 )
 
                 # Move file to __enqueued__ directory after enqueuing
+                final_path = file_path
                 try:
                     enqueued_dir = file_path.parent / "__enqueued__"
                     enqueued_dir.mkdir(exist_ok=True)
@@ -1916,6 +1917,7 @@ async def pipeline_enqueue_file(
 
                     # Move the file
                     file_path.rename(target_path)
+                    final_path = target_path
                     logger.debug(
                         f"Moved file to enqueued directory: {file_path.name} -> {unique_filename}"
                     )
@@ -1926,7 +1928,7 @@ async def pipeline_enqueue_file(
                     )
                     # Don't affect the main function's success status
 
-                return True, track_id
+                return True, track_id, final_path
 
             except Exception as e:
                 error_files = [
@@ -1939,7 +1941,7 @@ async def pipeline_enqueue_file(
                 ]
                 await rag.apipeline_enqueue_error_documents(error_files, track_id)
                 logger.error(f"Error enqueueing document {file_path.name}: {str(e)}")
-                return False, track_id
+                return False, track_id, None
         else:
             error_files = [
                 {
@@ -2320,7 +2322,7 @@ async def pipeline_index_file_with_metadata(
         try:
             # Use standard pipeline to enqueue and process
             logger.info(f"[METADATA PIPELINE] Step 6/7: Enqueueing file for processing")
-            success, returned_track_id = await pipeline_enqueue_file(
+            success, returned_track_id, final_path = await pipeline_enqueue_file(
                 rag, file_path, track_id
             )
             
@@ -2343,12 +2345,25 @@ async def pipeline_index_file_with_metadata(
             logger.debug(f"[METADATA PIPELINE] Chunking function restored")
             
             # Cleanup: Remove converted PDF if it was created from DOCX
-            if converted_pdf_path and converted_pdf_path.exists():
-                try:
-                    converted_pdf_path.unlink()
-                    logger.info(f"[METADATA PIPELINE] ✅ Cleaned up converted PDF: {converted_pdf_path.name}")
-                except Exception as cleanup_err:
-                    logger.warning(f"[METADATA PIPELINE] Failed to cleanup converted PDF: {cleanup_err}")
+            # Cleanup: Remove converted PDF if it was created from DOCX
+            if converted_pdf_path:
+                deleted = False
+                # 1. Try deleting at original location
+                if converted_pdf_path.exists():
+                    try:
+                        converted_pdf_path.unlink()
+                        deleted = True
+                        logger.info(f"[METADATA PIPELINE] ✅ Cleaned up converted PDF: {converted_pdf_path.name}")
+                    except Exception as cleanup_err:
+                        logger.warning(f"[METADATA PIPELINE] Failed to cleanup converted PDF at original path: {cleanup_err}")
+                
+                # 2. If NOT deleted (moved?) and we have a final_path, try there
+                if not deleted and 'final_path' in locals() and final_path and final_path.exists() and final_path != converted_pdf_path:
+                    try:
+                        final_path.unlink()
+                        logger.info(f"[METADATA PIPELINE] ✅ Cleaned up converted PDF at final location: {final_path.name}")
+                    except Exception as cleanup_err:
+                        logger.warning(f"[METADATA PIPELINE] Failed to cleanup converted PDF at final path: {cleanup_err}")
             
             # Cleanup: Remove original DOCX file after successful conversion and processing
             if original_docx_path and original_docx_path.exists():
@@ -2391,7 +2406,7 @@ async def pipeline_index_file(rag: LightRAG, file_path: Path, track_id: str = No
         track_id: Optional tracking ID
     """
     try:
-        success, returned_track_id = await pipeline_enqueue_file(
+        success, returned_track_id, _ = await pipeline_enqueue_file(
             rag, file_path, track_id
         )
         if success:
@@ -2424,7 +2439,7 @@ async def pipeline_index_files(
 
         # Process files sequentially with track_id
         for file_path in sorted_file_paths:
-            success, _ = await pipeline_enqueue_file(rag, file_path, track_id)
+            success, _, _ = await pipeline_enqueue_file(rag, file_path, track_id)
             if success:
                 enqueued = True
 
