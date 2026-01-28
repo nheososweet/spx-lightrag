@@ -2173,6 +2173,7 @@ async def pipeline_index_file_with_metadata(
     full_text_for_tracking = None
     converted_pdf_path = None  # Track converted PDF for cleanup
     original_docx_path = None  # Track original DOCX file for cleanup
+    final_path = None  # Track final enqueued path for cleanup
     
     try:
         # Step 1: Check if DOCX file and convert to PDF if needed
@@ -2344,28 +2345,24 @@ async def pipeline_index_file_with_metadata(
             rag.chunking_func = original_chunking_func
             logger.debug(f"[METADATA PIPELINE] Chunking function restored")
             
-            # Cleanup: Remove converted PDF if it was created from DOCX
-            # Cleanup: Remove converted PDF if it was created from DOCX
-            if converted_pdf_path:
-                deleted = False
-                # 1. Try deleting at original location
-                if converted_pdf_path.exists():
-                    try:
-                        converted_pdf_path.unlink()
-                        deleted = True
-                        logger.info(f"[METADATA PIPELINE] ✅ Cleaned up converted PDF: {converted_pdf_path.name}")
-                    except Exception as cleanup_err:
-                        logger.warning(f"[METADATA PIPELINE] Failed to cleanup converted PDF at original path: {cleanup_err}")
-                
-                # 2. If NOT deleted (moved?) and we have a final_path, try there
-                if not deleted and 'final_path' in locals() and final_path and final_path.exists() and final_path != converted_pdf_path:
-                    try:
-                        final_path.unlink()
-                        logger.info(f"[METADATA PIPELINE] ✅ Cleaned up converted PDF at final location: {final_path.name}")
-                    except Exception as cleanup_err:
-                        logger.warning(f"[METADATA PIPELINE] Failed to cleanup converted PDF at final path: {cleanup_err}")
+            # Cleanup: Remove enqueued file (the "temporary" copy)
+            if final_path and final_path.exists():
+                try:
+                    final_path.unlink()
+                    logger.info(f"[METADATA PIPELINE] ✅ Cleaned up enqueued file: {final_path.name}")
+                except Exception as cleanup_err:
+                    logger.warning(f"[METADATA PIPELINE] Failed to cleanup enqueued file: {cleanup_err}")
             
-            # Cleanup: Remove original DOCX file after successful conversion and processing
+            # Cleanup: Remove converted PDF if it was created from DOCX 
+            # (Note: if it was enqueued, final_path already handled it, so this is just for safety)
+            if converted_pdf_path and converted_pdf_path.exists():
+                try:
+                    converted_pdf_path.unlink()
+                    logger.info(f"[METADATA PIPELINE] ✅ Cleaned up converted PDF: {converted_pdf_path.name}")
+                except Exception:
+                    pass
+            
+            # Cleanup: Remove original DOCX file
             if original_docx_path and original_docx_path.exists():
                 try:
                     original_docx_path.unlink()
@@ -3106,6 +3103,49 @@ def create_document_routes(
                     detail=f"Unsupported file type. Supported types: {doc_manager.supported_extensions}",
                 )
             logger.info(f"[UPLOAD FROM URL] ✓ File type is supported")
+
+            # Step 3.5: Check if file_id already exists in chunks_vdb (Milvus)
+            if request.file_id:
+                logger.info(f"[UPLOAD FROM URL] Step 3.5/6: Checking for duplicate file_id: {request.file_id}")
+                try:
+                    # Check if chunks_vdb supports get_doc_ids_by_file_id (MilvusVectorDBStorage specific)
+                    if hasattr(rag.chunks_vdb, "get_doc_ids_by_file_id"):
+                        existing_doc_ids = await rag.chunks_vdb.get_doc_ids_by_file_id(request.file_id, include_deleted=True)
+                        
+                        if existing_doc_ids:
+                            all_deleted = True
+                            doc_statuses = []
+                            
+                            for d_id in existing_doc_ids:
+                                d_status = await rag.doc_status.get_by_id(d_id)
+                                if d_status and not d_status.get("isDeleted", False):
+                                    all_deleted = False
+                                doc_statuses.append((d_id, d_status))
+                            
+                            if all_deleted:
+                                logger.info(f"[UPLOAD FROM URL] Found {len(existing_doc_ids)} soft-deleted documents with file_id='{request.file_id}'. Reactivating...")
+                                for d_id, _ in doc_statuses:
+                                    if d_id:
+                                        await rag.aactive_by_doc_id(d_id)
+                                
+                                track_id = doc_statuses[0][1].get("track_id") if doc_statuses and doc_statuses[0][1] else ""
+                                return InsertResponse(
+                                    status="success",
+                                    message=f"Documents with file_id='{request.file_id}' were previously deleted and have been restored.",
+                                    track_id=track_id or "",
+                                )
+                            else:
+                                 # Duplicate found and NOT all deleted.
+                                 logger.warning(f"[UPLOAD FROM URL] Duplicate file_id found: {request.file_id} (some active)")
+                                 track_id = doc_statuses[0][1].get("track_id") if doc_statuses and doc_statuses[0][1] else ""
+                                 return InsertResponse(
+                                    status="duplicated",
+                                    message=f"Document with file_id='{request.file_id}' already exists.",
+                                    track_id=track_id or "",
+                                 )
+
+                except Exception as e:
+                    logger.warning(f"[UPLOAD FROM URL] Failed to check duplicate file_id: {e}")
 
             # Check if filename already exists in doc_status storage
             logger.info(f"[UPLOAD FROM URL] Step 4/6: Checking for duplicates")
