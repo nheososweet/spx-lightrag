@@ -231,6 +231,11 @@ class InsertTextRequest(BaseModel):
         min_length=1,
         description="Table name for categorizing the document",
     )
+    file_id: Optional[str] = Field(
+        default=None,
+        description="Unique identifier for the file/text source (optional)",
+    )
+
 
     @field_validator("text", mode="after")
     @classmethod
@@ -259,6 +264,7 @@ class InsertTextRequest(BaseModel):
                 "text": "This is a sample text to be inserted into the RAG system.",
                 "file_source": "manual_input",
                 "table_name": "user_documents",
+                "file_id": "doc_001",
             }
         }
 
@@ -2581,12 +2587,15 @@ async def pipeline_index_texts_with_metadata(
         for chunk in chunks:
             # Add table_name from custom metadata
             chunk["table_name"] = current_metadata.get("table_name", "")
+            # Add file_id from custom metadata (if present)
+            chunk["file_id"] = current_metadata.get("file_id", "")
             # Add isDeleted flag for soft delete support (default False for new chunks)
             chunk["isDeleted"] = False
         
         logger.debug(
             f"[METADATA TEXT PIPELINE] Injected metadata into {len(chunks)} chunks: "
-            f"table_name={current_metadata.get('table_name', 'N/A')}"
+            f"table_name={current_metadata.get('table_name', 'N/A')}, "
+            f"file_id={current_metadata.get('file_id', 'N/A')}"
         )
         
         return chunks
@@ -3429,6 +3438,7 @@ def create_document_routes(
             # Prepare custom metadata for injection into chunks
             custom_metadata = {
                 "table_name": request.table_name,
+                "file_id": request.file_id or "",
             }
 
             # Use new pipeline function with metadata injection
