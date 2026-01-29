@@ -181,6 +181,14 @@ class QueryParam:
     to a specific document collection or data source.
     """
 
+    category: str | None = None
+    """Optional category filter for Milvus vector search.
+    When provided, the vector search will only return chunks that have a matching
+    category in their dynamic fields. This is a higher-level classification than table_name
+    (e.g., category='School', table_name='Classroom'). When both table_name and category
+    are provided, they are combined with AND logic for filtering.
+    """
+
 
 @dataclass
 class StorageNameSpace(ABC):

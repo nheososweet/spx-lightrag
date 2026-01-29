@@ -2648,6 +2648,7 @@ class LightRAG:
             user_prompt=param.user_prompt,
             enable_rerank=param.enable_rerank,
             table_name=param.table_name,
+            category=param.category,
         )
 
         query_result = None

@@ -115,6 +115,11 @@ class QueryRequest(BaseModel):
         description="Optional table name filter for Milvus vector search. When provided, the vector search will only return chunks that have a matching table_name in their dynamic fields. This is useful for filtering search results to a specific document collection or data source.",
     )
 
+    category: Optional[str] = Field(
+        default=None,
+        description="Optional category filter for Milvus vector search. When provided, the vector search will only return chunks that have a matching category in their dynamic fields. This is a higher-level classification than table_name. When both table_name and category are provided, they are combined with AND logic.",
+    )
+
     @field_validator("query", mode="after")
     @classmethod
     def query_strip_after(cls, query: str) -> str:

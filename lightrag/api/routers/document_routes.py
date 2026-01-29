@@ -215,6 +215,7 @@ class InsertTextRequest(BaseModel):
         text: The text content to be inserted into the RAG system
         file_source: Source identifier (defaults to "paragraph" if empty)
         table_name: Table/category name for organizing documents (required)
+        category: Higher-level classification for documents (optional)
     """
 
     text: str = Field(
@@ -230,6 +231,10 @@ class InsertTextRequest(BaseModel):
         ...,
         min_length=1,
         description="Table name for categorizing the document",
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description="Higher-level category for classification (e.g., 'School' while table_name is 'Classroom')",
     )
     file_id: Optional[str] = Field(
         default=None,
@@ -264,6 +269,7 @@ class InsertTextRequest(BaseModel):
                 "text": "This is a sample text to be inserted into the RAG system.",
                 "file_source": "manual_input",
                 "table_name": "user_documents",
+                "category": "general",
                 "file_id": "doc_001",
             }
         }
@@ -275,6 +281,7 @@ class UploadFromURLRequest(BaseModel):
     Attributes:
         file_url: URL of the file to download and process
         table_name: Table name for categorizing the document
+        category: Higher-level classification for documents (optional)
         file_id: Unique identifier for the file
         run_background: Whether to process in background (True) or wait for completion (False)
     """
@@ -283,6 +290,10 @@ class UploadFromURLRequest(BaseModel):
         ..., description="URL of the file to download and process"
     )
     table_name: str = Field(..., description="Table name for categorizing the document")
+    category: Optional[str] = Field(
+        default=None,
+        description="Higher-level category for classification (e.g., 'School' while table_name is 'Classroom')",
+    )
     file_id: str = Field(..., description="Unique identifier for the file")
     run_background: bool = Field(
         default=True,
@@ -312,6 +323,7 @@ class UploadFromURLRequest(BaseModel):
             "example": {
                 "file_url": "https://example.com/documents/policy.pdf",
                 "table_name": "company_policies",
+                "category": "corporate",
                 "file_id": "POL_001",
                 "run_background": False,
             }
@@ -350,6 +362,10 @@ class ReplaceFileByIdRequest(BaseModel):
         ..., 
         description="Table name for categorizing the new document"
     )
+    category: Optional[str] = Field(
+        default=None,
+        description="Higher-level category for classification (e.g., 'School' while table_name is 'Classroom')",
+    )
     run_background: bool = Field(
         default=True,
         description="If True, process in background. If False, wait for completion."
@@ -384,6 +400,7 @@ class ReplaceFileByIdRequest(BaseModel):
                 "file_id": "c7a24784-9402-4bdd-98a7-d03a9a53e7cd",
                 "file_url": "https://s3.../documents/report_v2.pdf",
                 "table_name": "company_policies",
+                "category": "corporate",
                 "run_background": False,
                 "delete_llm_cache": True,
             }
@@ -2308,6 +2325,7 @@ async def pipeline_index_file_with_metadata(
                 # Inject custom metadata
                 chunk["file_url"] = custom_metadata.get("file_url", "")
                 chunk["table_name"] = custom_metadata.get("table_name", "")
+                chunk["category"] = custom_metadata.get("category", "")
                 chunk["file_id"] = custom_metadata.get("file_id", "")
                 
                 # Inject page numbers
@@ -2326,6 +2344,7 @@ async def pipeline_index_file_with_metadata(
                         f"[METADATA PIPELINE] Chunk 0 metadata example:\n"
                         f"  file_url: {chunk.get('file_url')[:60]}...\n"
                         f"  table_name: {chunk.get('table_name')}\n"
+                        f"  category: {chunk.get('category')}\n"
                         f"  file_id: {chunk.get('file_id')}\n"
                         f"  start_page: {chunk.get('start_page')}\n"
                         f"  end_page: {chunk.get('end_page')}\n"
@@ -2587,6 +2606,8 @@ async def pipeline_index_texts_with_metadata(
         for chunk in chunks:
             # Add table_name from custom metadata
             chunk["table_name"] = current_metadata.get("table_name", "")
+            # Add category from custom metadata
+            chunk["category"] = current_metadata.get("category", "")
             # Add file_id from custom metadata (if present)
             chunk["file_id"] = current_metadata.get("file_id", "")
             # Add isDeleted flag for soft delete support (default False for new chunks)
@@ -2595,6 +2616,7 @@ async def pipeline_index_texts_with_metadata(
         logger.debug(
             f"[METADATA TEXT PIPELINE] Injected metadata into {len(chunks)} chunks: "
             f"table_name={current_metadata.get('table_name', 'N/A')}, "
+            f"category={current_metadata.get('category', 'N/A')}, "
             f"file_id={current_metadata.get('file_id', 'N/A')}"
         )
         
@@ -3196,12 +3218,13 @@ def create_document_routes(
     async def _internal_upload_from_url(
         file_url: str,
         table_name: str,
+        category: str | None,
         file_id: str,
         run_background: bool,
         background_tasks: BackgroundTasks,
     ) -> InsertResponse:
         """Internal helper for upload_from_url logic, shared by multiple endpoints."""
-        logger.info(f"[INTERNAL UPLOAD] Processing: {file_url} (table: {table_name}, id: {file_id})")
+        logger.info(f"[INTERNAL UPLOAD] Processing: {file_url} (table: {table_name}, category: {category}, id: {file_id})")
         
         try:
             # Extract filename from URL
@@ -3316,6 +3339,7 @@ def create_document_routes(
             custom_metadata = {
                 "file_url": file_url,
                 "table_name": table_name,
+                "category": category or "",
                 "file_id": file_id,
             }
 
@@ -3357,6 +3381,7 @@ def create_document_routes(
         return await _internal_upload_from_url(
             file_url=request.file_url,
             table_name=request.table_name,
+            category=request.category,
             file_id=request.file_id,
             run_background=request.run_background,
             background_tasks=background_tasks,
@@ -3438,6 +3463,7 @@ def create_document_routes(
             # Prepare custom metadata for injection into chunks
             custom_metadata = {
                 "table_name": request.table_name,
+                "category": request.category or "",
                 "file_id": request.file_id or "",
             }
 
@@ -4932,6 +4958,7 @@ def create_document_routes(
         upload_resp = await _internal_upload_from_url(
             file_url=request.file_url,
             table_name=request.table_name,
+            category=request.category,
             file_id=request.file_id,
             run_background=request.run_background,
             background_tasks=background_tasks,

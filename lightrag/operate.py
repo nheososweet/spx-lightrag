@@ -382,6 +382,7 @@ async def _handle_single_entity_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
     table_name: str | None = None,  # Multi-tenancy: propagate table_name from chunk
+    category: str | None = None,  # Multi-tenancy: propagate category from chunk
 ):
     if len(record_attributes) != 4 or "entity" not in record_attributes[0]:
         if len(record_attributes) > 1 and "entity" in record_attributes[0]:
@@ -428,7 +429,7 @@ async def _handle_single_entity_extraction(
             )
             return None
 
-        # Store entity data with table_name for multi-tenancy filtering
+        # Store entity data with table_name and category for multi-tenancy filtering
         entity_data = dict(
             entity_name=entity_name,
             entity_type=entity_type,
@@ -440,6 +441,9 @@ async def _handle_single_entity_extraction(
         # Add table_name if available (None is acceptable for backward compatibility)
         if table_name is not None:
             entity_data["table_name"] = table_name
+        # Add category if available (None is acceptable for backward compatibility)
+        if category is not None:
+            entity_data["category"] = category
         return entity_data
 
     except ValueError as e:
@@ -460,6 +464,7 @@ async def _handle_single_relationship_extraction(
     timestamp: int,
     file_path: str = "unknown_source",
     table_name: str | None = None,  # Multi-tenancy: propagate table_name from chunk
+    category: str | None = None,  # Multi-tenancy: propagate category from chunk
 ):
     if (
         len(record_attributes) != 5 or "relation" not in record_attributes[0]
@@ -514,7 +519,7 @@ async def _handle_single_relationship_extraction(
             else 1.0
         )
 
-        # Store relationship data with table_name for multi-tenancy filtering
+        # Store relationship data with table_name and category for multi-tenancy filtering
         relationship_data = dict(
             src_id=source,
             tgt_id=target,
@@ -528,6 +533,9 @@ async def _handle_single_relationship_extraction(
         # Add table_name if available (None is acceptable for backward compatibility)
         if table_name is not None:
             relationship_data["table_name"] = table_name
+        # Add category if available (None is acceptable for backward compatibility)
+        if category is not None:
+            relationship_data["category"] = category
         return relationship_data
 
     except ValueError as e:
@@ -927,6 +935,7 @@ async def _process_extraction_result(
     tuple_delimiter: str = "<|#|>",
     completion_delimiter: str = "<|COMPLETE|>",
     table_name: str | None = None,  # Multi-tenancy: propagate table_name to entities/relationships
+    category: str | None = None,  # Multi-tenancy: propagate category to entities/relationships
 ) -> tuple[dict, dict]:
     """Process a single extraction result (either initial or gleaning)
     Args:
@@ -1006,9 +1015,9 @@ async def _process_extraction_result(
 
         record_attributes = split_string_by_multi_markers(record, [tuple_delimiter])
 
-        # Try to parse as entity (with table_name for filtering)
+        # Try to parse as entity (with table_name and category for filtering)
         entity_data = await _handle_single_entity_extraction(
-            record_attributes, chunk_key, timestamp, file_path, table_name
+            record_attributes, chunk_key, timestamp, file_path, table_name, category
         )
         if entity_data is not None:
             truncated_name = _truncate_entity_identifier(
@@ -1021,9 +1030,9 @@ async def _process_extraction_result(
             maybe_nodes[truncated_name].append(entity_data)
             continue
 
-        # Try to parse as relationship (with table_name for filtering)
+        # Try to parse as relationship (with table_name and category for filtering)
         relationship_data = await _handle_single_relationship_extraction(
-            record_attributes, chunk_key, timestamp, file_path, table_name
+            record_attributes, chunk_key, timestamp, file_path, table_name, category
         )
         if relationship_data is not None:
             truncated_source = _truncate_entity_identifier(
@@ -1845,8 +1854,9 @@ async def _merge_nodes_then_upsert(
         logger.debug(status_message)
 
     # 11. Update both graph and vector db
-    # Extract table_name from first node (all nodes for same entity have same table_name)
+    # Extract table_name and category from first node (all nodes for same entity have same table_name/category)
     table_name = nodes_data[0].get("table_name") if nodes_data else None
+    category = nodes_data[0].get("category") if nodes_data else None
     
     node_data = dict(
         entity_id=entity_name,
@@ -1857,6 +1867,7 @@ async def _merge_nodes_then_upsert(
         created_at=int(time.time()),
         truncate=truncation_info,
         table_name=table_name,  # Propagate table_name for multi-tenancy filtering
+        category=category,  # Propagate category for multi-tenancy filtering
     )
     await knowledge_graph_inst.upsert_node(
         entity_name,
@@ -1866,7 +1877,7 @@ async def _merge_nodes_then_upsert(
     if entity_vdb is not None:
         entity_vdb_id = compute_mdhash_id(str(entity_name), prefix="ent-")
         entity_content = f"{entity_name}\n{description}"
-        # Prepare entity vector data with table_name for multi-tenancy filtering
+        # Prepare entity vector data with table_name and category for multi-tenancy filtering
         data_for_vdb = {
             entity_vdb_id: {
                 "entity_name": entity_name,
@@ -1875,6 +1886,7 @@ async def _merge_nodes_then_upsert(
                 "source_id": source_id,
                 "file_path": file_path,
                 "table_name": node_data.get("table_name"),  # Propagate table_name from node_data
+                "category": node_data.get("category"),  # Propagate category from node_data
             }
         }
         await safe_vdb_operation_with_exception(
@@ -2350,8 +2362,9 @@ async def _merge_edges_then_upsert(
                         pipeline_status["latest_message"] = status_message
                         pipeline_status["history_messages"].append(status_message)
 
-    # Extract table_name from first edge (all edges for same relationship have same table_name)
+    # Extract table_name and category from first edge (all edges for same relationship have same table_name/category)
     table_name = edges_data[0].get("table_name") if edges_data else None
+    category = edges_data[0].get("category") if edges_data else None
     
     edge_created_at = int(time.time())
     await knowledge_graph_inst.upsert_edge(
@@ -2366,6 +2379,7 @@ async def _merge_edges_then_upsert(
             created_at=edge_created_at,
             truncate=truncation_info,
             table_name=table_name,  # Propagate table_name for multi-tenancy filtering
+            category=category,  # Propagate category for multi-tenancy filtering
         ),
     )
 
@@ -2380,6 +2394,7 @@ async def _merge_edges_then_upsert(
         truncate=truncation_info,
         weight=weight,
         table_name=table_name,  # Propagate table_name for multi-tenancy filtering
+        category=category,  # Propagate category for multi-tenancy filtering
     )
 
     # Sort src_id and tgt_id to ensure consistent ordering (smaller string first)
@@ -2396,7 +2411,7 @@ async def _merge_edges_then_upsert(
                 f"Could not delete old relationship vector records {rel_vdb_id}, {rel_vdb_id_reverse}: {e}"
             )
         rel_content = f"{keywords}\t{src_id}\n{tgt_id}\n{description}"
-        # Prepare relationship vector data with table_name for multi-tenancy filtering
+        # Prepare relationship vector data with table_name and category for multi-tenancy filtering
         vdb_data = {
             rel_vdb_id: {
                 "src_id": src_id,
@@ -2408,6 +2423,7 @@ async def _merge_edges_then_upsert(
                 "weight": weight,
                 "file_path": file_path,
                 "table_name": edge_data.get("table_name"),  # Propagate table_name from edge_data
+                "category": edge_data.get("category"),  # Propagate category from edge_data
             }
         }
         await safe_vdb_operation_with_exception(
@@ -2853,17 +2869,18 @@ async def extract_entities(
         content = chunk_dp["content"]
         # Get file path from chunk data or use default
         file_path = chunk_dp.get("file_path", "unknown_source")
-        # Extract table_name from chunk for multi-tenancy filtering
+        # Extract table_name and category from chunk for multi-tenancy filtering
         table_name = chunk_dp.get("table_name")
+        category = chunk_dp.get("category")
         
-        # Debug log for table_name propagation
-        if table_name:
+        # Debug log for table_name and category propagation
+        if table_name or category:
             logger.debug(
-                f"[ENTITY EXTRACTION] Chunk {chunk_key}: table_name={table_name}"
+                f"[ENTITY EXTRACTION] Chunk {chunk_key}: table_name={table_name}, category={category}"
             )
         else:
             logger.debug(
-                f"[ENTITY EXTRACTION] Chunk {chunk_key}: No table_name in chunk data"
+                f"[ENTITY EXTRACTION] Chunk {chunk_key}: No table_name or category in chunk data"
             )
 
         # Create cache keys collector for batch processing
@@ -2896,7 +2913,7 @@ async def extract_entities(
             entity_extraction_user_prompt, final_result
         )
 
-        # Process initial extraction with file path and table_name
+        # Process initial extraction with file path, table_name and category
         maybe_nodes, maybe_edges = await _process_extraction_result(
             final_result,
             chunk_key,
@@ -2905,6 +2922,7 @@ async def extract_entities(
             tuple_delimiter=context_base["tuple_delimiter"],
             completion_delimiter=context_base["completion_delimiter"],
             table_name=table_name,  # Propagate table_name to extracted entities/relationships
+            category=category,  # Propagate category to extracted entities/relationships
         )
 
         # Process additional gleaning results only 1 time when entity_extract_max_gleaning is greater than zero.
@@ -2920,7 +2938,7 @@ async def extract_entities(
                 cache_keys_collector=cache_keys_collector,
             )
 
-            # Process gleaning result separately with file path and table_name
+            # Process gleaning result separately with file path, table_name and category
             glean_nodes, glean_edges = await _process_extraction_result(
                 glean_result,
                 chunk_key,
@@ -2929,6 +2947,7 @@ async def extract_entities(
                 tuple_delimiter=context_base["tuple_delimiter"],
                 completion_delimiter=context_base["completion_delimiter"],
                 table_name=table_name,  # Propagate table_name to gleaning entities/relationships
+                category=category,  # Propagate category to gleaning entities/relationships
             )
 
             # Merge results - compare description lengths to choose better version
@@ -3549,10 +3568,17 @@ async def _perform_kg_search(
 
         # Get vector chunks for mix mode
         if query_param.mode == "mix" and chunks_vdb:
-            # Construct the filter expression if a table_name is provided
+            # Construct the filter expression if table_name and/or category is provided
             filter_expression = None
+            filters = []
             if query_param.table_name:
-                filter_expression = f"table_name == '{query_param.table_name}'"
+                filters.append(f"table_name == '{query_param.table_name}'")
+            if query_param.category:
+                filters.append(f"category == '{query_param.category}'")
+            
+            # Combine filters with AND logic
+            if filters:
+                filter_expression = " and ".join(filters)
 
             vector_chunks = await _get_vector_context(
                 query,
@@ -3897,18 +3923,35 @@ async def _merge_all_chunks(
         f"Round-robin merged chunks: {origin_len} -> {len(merged_chunks)} (deduplicated {origin_len - len(merged_chunks)})"
     )
 
-    # Apply table_name filter if specified in query_param
-    # This ensures chunks from KG (entities/relations) are also filtered by table_name
-    if query_param and query_param.table_name:
-        filtered_by_table = [
-            chunk
-            for chunk in merged_chunks
-            if chunk.get("table_name") == query_param.table_name
-        ]
+    # Apply table_name and/or category filter if specified in query_param
+    # This ensures chunks from KG (entities/relations) are also filtered by table_name/category
+    if query_param and (query_param.table_name or query_param.category):
+        filtered_chunks = merged_chunks
+        
+        if query_param.table_name:
+            filtered_chunks = [
+                chunk
+                for chunk in filtered_chunks
+                if chunk.get("table_name") == query_param.table_name
+            ]
+        
+        if query_param.category:
+            filtered_chunks = [
+                chunk
+                for chunk in filtered_chunks
+                if chunk.get("category") == query_param.category
+            ]
+        
+        filter_info = []
+        if query_param.table_name:
+            filter_info.append(f"table_name='{query_param.table_name}'")
+        if query_param.category:
+            filter_info.append(f"category='{query_param.category}'")
+        
         logger.info(
-            f"Table name filter applied: {len(merged_chunks)} -> {len(filtered_by_table)} chunks (table_name='{query_param.table_name}')"
+            f"Filter applied: {len(merged_chunks)} -> {len(filtered_chunks)} chunks ({', '.join(filter_info)})"
         )
-        merged_chunks = filtered_by_table
+        merged_chunks = filtered_chunks
 
     return merged_chunks
 
@@ -3928,10 +3971,10 @@ async def _build_context_str(
     Build the final LLM context string with token processing.
     This includes dynamic token calculation and final chunk truncation.
     """
-    # Apply table_name filter to entities and relations if specified
-    # This ensures entities/relations from KG are also filtered by table_name
+    # Apply table_name and/or category filter to entities and relations if specified
+    # This ensures entities/relations from KG are also filtered by table_name/category
     # Filter by source_id (chunk_ids) instead of file_path for accuracy
-    if query_param and query_param.table_name and merged_chunks:
+    if query_param and (query_param.table_name or query_param.category) and merged_chunks:
         # Get the set of chunk_ids from filtered chunks
         valid_chunk_ids = {
             chunk.get("chunk_id") or chunk.get("id")
@@ -3990,7 +4033,7 @@ async def _build_context_str(
                     )
                 ]
             logger.info(
-                f"Table name filter applied to entities: {original_entities_count} -> {len(entities_context)} "
+                f"Filter applied to entities: {original_entities_count} -> {len(entities_context)} "
                 f"(valid chunk_ids: {len(valid_chunk_ids)}, valid file_paths: {len(valid_file_paths)})"
             )
 
@@ -4007,7 +4050,7 @@ async def _build_context_str(
                     )
                 ]
             logger.info(
-                f"Table name filter applied to relations: {original_relations_count} -> {len(relations_context)}"
+                f"Filter applied to relations: {original_relations_count} -> {len(relations_context)}"
             )
 
             # Also filter entity_id_to_original and relation_id_to_original mappings
@@ -4319,13 +4362,20 @@ async def _get_node_data(
     entities_vdb: BaseVectorStorage,
     query_param: QueryParam,
 ):
-    # get similar entities with optional table_name filter for multi-tenancy
+    # get similar entities with optional table_name and category filter for multi-tenancy
     logger.info(
         f"Query nodes: {query} (top_k:{query_param.top_k}, cosine:{entities_vdb.cosine_better_than_threshold})"
     )
 
-    # Apply table_name filter if specified (strict multi-tenancy isolation)
-    filter_expr = f'table_name == "{query_param.table_name}"' if query_param.table_name else None
+    # Apply table_name and/or category filter if specified (strict multi-tenancy isolation)
+    filters = []
+    if query_param.table_name:
+        filters.append(f'table_name == "{query_param.table_name}"')
+    if query_param.category:
+        filters.append(f'category == "{query_param.category}"')
+    
+    # Combine filters with AND logic
+    filter_expr = " and ".join(filters) if filters else None
     results = await entities_vdb.query(query, top_k=query_param.top_k, filter=filter_expr)
 
     if not len(results):
@@ -4598,8 +4648,15 @@ async def _get_edge_data(
         f"Query edges: {keywords} (top_k:{query_param.top_k}, cosine:{relationships_vdb.cosine_better_than_threshold})"
     )
 
-    # Apply table_name filter if specified (strict multi-tenancy isolation)
-    filter_expr = f'table_name == "{query_param.table_name}"' if query_param.table_name else None
+    # Apply table_name and/or category filter if specified (strict multi-tenancy isolation)
+    filters = []
+    if query_param.table_name:
+        filters.append(f'table_name == "{query_param.table_name}"')
+    if query_param.category:
+        filters.append(f'category == "{query_param.category}"')
+    
+    # Combine filters with AND logic
+    filter_expr = " and ".join(filters) if filters else None
     results = await relationships_vdb.query(keywords, top_k=query_param.top_k, filter=filter_expr)
 
     if not len(results):
@@ -4950,10 +5007,17 @@ async def naive_query(
         logger.error("Tokenizer not found in global configuration.")
         return QueryResult(content=PROMPTS["fail_response"])
 
-    # Construct the filter expression if a table_name is provided
+    # Construct the filter expression if table_name and/or category is provided
     filter_expression = None
+    filters = []
     if query_param.table_name:
-        filter_expression = f"table_name == '{query_param.table_name}'"
+        filters.append(f"table_name == '{query_param.table_name}'")
+    if query_param.category:
+        filters.append(f"category == '{query_param.category}'")
+    
+    # Combine filters with AND logic
+    if filters:
+        filter_expression = " and ".join(filters)
 
     chunks = await _get_vector_context(
         query, chunks_vdb, query_param, None, filter=filter_expression

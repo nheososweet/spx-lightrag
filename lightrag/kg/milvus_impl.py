@@ -983,15 +983,15 @@ class MilvusVectorDBStorage(BaseVectorStorage):
 
         # Add custom metadata fields for chunks namespace to support Dynamic Fields
         if self.namespace.endswith("chunks"):
-            self.meta_fields.update(["file_url", "table_name", "file_id", "content"])
+            self.meta_fields.update(["file_url", "table_name", "category", "file_id", "content"])
             logger.debug(
-                f"[{self.workspace}] Added custom metadata fields to chunks namespace: file_url, table_name, file_id, content"
+                f"[{self.workspace}] Added custom metadata fields to chunks namespace: file_url, table_name, category, file_id, content"
             )
-        # Add table_name field to entities and relationships for multi-tenancy filtering
+        # Add table_name and category fields to entities and relationships for multi-tenancy filtering
         elif self.namespace.endswith("entities") or self.namespace.endswith("relationships"):
-            self.meta_fields.update(["table_name"])
+            self.meta_fields.update(["table_name", "category"])
             logger.debug(
-                f"[{self.workspace}] Added table_name metadata field to {self.namespace} namespace for filtering support"
+                f"[{self.workspace}] Added table_name and category metadata fields to {self.namespace} namespace for filtering support"
             )
 
         # Initialize client as None - will be created in initialize() method
