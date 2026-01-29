@@ -3354,7 +3354,7 @@ def create_document_routes(
         )
 
     @router.post(
-        "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)], include_in_schema=False
+        "/text", response_model=InsertResponse, dependencies=[Depends(combined_auth)]
     )
     async def insert_text(
         request: InsertTextRequest, background_tasks: BackgroundTasks
