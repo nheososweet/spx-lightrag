@@ -240,6 +240,10 @@ class InsertTextRequest(BaseModel):
         default=None,
         description="Unique identifier for the file/text source (optional)",
     )
+    run_background: bool = Field(
+        default=True,
+        description="If True, process in background and return immediately. If False, wait for processing to complete.",
+    )
 
 
     @field_validator("text", mode="after")
@@ -271,6 +275,7 @@ class InsertTextRequest(BaseModel):
                 "table_name": "user_documents",
                 "category": "general",
                 "file_id": "doc_001",
+                "run_background": True,
             }
         }
 
@@ -3468,20 +3473,36 @@ def create_document_routes(
             }
 
             # Use new pipeline function with metadata injection
-            background_tasks.add_task(
-                pipeline_index_texts_with_metadata,
-                rag,
-                [request.text],
-                file_sources=[request.file_source],
-                custom_metadata_list=[custom_metadata],
-                track_id=track_id,
-            )
+            if request.run_background:
+                background_tasks.add_task(
+                    pipeline_index_texts_with_metadata,
+                    rag,
+                    [request.text],
+                    file_sources=[request.file_source],
+                    custom_metadata_list=[custom_metadata],
+                    track_id=track_id,
+                )
 
-            return InsertResponse(
-                status="success",
-                message="Text successfully received. Processing will continue in background.",
-                track_id=track_id,
-            )
+                return InsertResponse(
+                    status="success",
+                    message="Text successfully received. Processing will continue in background.",
+                    track_id=track_id,
+                )
+            else:
+                # Process synchronously and wait for completion
+                await pipeline_index_texts_with_metadata(
+                    rag,
+                    [request.text],
+                    file_sources=[request.file_source],
+                    custom_metadata_list=[custom_metadata],
+                    track_id=track_id,
+                )
+
+                return InsertResponse(
+                    status="success",
+                    message="Text successfully processed and indexed.",
+                    track_id=track_id,
+                )
         except Exception as e:
             logger.error(f"Error /documents/text: {str(e)}")
             logger.error(traceback.format_exc())

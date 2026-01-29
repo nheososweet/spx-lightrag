@@ -186,7 +186,12 @@ class QueryParam:
     When provided, the vector search will only return chunks that have a matching
     category in their dynamic fields. This is a higher-level classification than table_name
     (e.g., category='School', table_name='Classroom'). When both table_name and category
-    are provided, they are combined with AND logic for filtering.
+    are provided, they are combined with AND logic (default) or OR logic based on filter_logic.
+    """
+
+    filter_logic: str = "and"
+    """Logic operator for combining table_name and category filters.
+    Options: 'and' (default) or 'or'. Only applies when both table_name and category are provided.
     """
 
 

@@ -3576,9 +3576,10 @@ async def _perform_kg_search(
             if query_param.category:
                 filters.append(f"category == '{query_param.category}'")
             
-            # Combine filters with AND logic
+            # Combine filters with specified logic (AND or OR)
             if filters:
-                filter_expression = " and ".join(filters)
+                logic_op = " or " if query_param.filter_logic.lower() == "or" else " and "
+                filter_expression = logic_op.join(filters)
 
             vector_chunks = await _get_vector_context(
                 query,
@@ -3926,21 +3927,32 @@ async def _merge_all_chunks(
     # Apply table_name and/or category filter if specified in query_param
     # This ensures chunks from KG (entities/relations) are also filtered by table_name/category
     if query_param and (query_param.table_name or query_param.category):
-        filtered_chunks = merged_chunks
+        filter_logic = query_param.filter_logic.lower() if query_param.filter_logic else "and"
         
-        if query_param.table_name:
+        if filter_logic == "or":
+            # OR logic: chunk matches if it satisfies ANY filter
             filtered_chunks = [
-                chunk
-                for chunk in filtered_chunks
-                if chunk.get("table_name") == query_param.table_name
+                chunk for chunk in merged_chunks
+                if (query_param.table_name and chunk.get("table_name") == query_param.table_name) or
+                   (query_param.category and chunk.get("category") == query_param.category)
             ]
-        
-        if query_param.category:
-            filtered_chunks = [
-                chunk
-                for chunk in filtered_chunks
-                if chunk.get("category") == query_param.category
-            ]
+        else:
+            # AND logic (default): apply filters sequentially
+            filtered_chunks = merged_chunks
+            
+            if query_param.table_name:
+                filtered_chunks = [
+                    chunk
+                    for chunk in filtered_chunks
+                    if chunk.get("table_name") == query_param.table_name
+                ]
+            
+            if query_param.category:
+                filtered_chunks = [
+                    chunk
+                    for chunk in filtered_chunks
+                    if chunk.get("category") == query_param.category
+                ]
         
         filter_info = []
         if query_param.table_name:
@@ -3948,8 +3960,9 @@ async def _merge_all_chunks(
         if query_param.category:
             filter_info.append(f"category='{query_param.category}'")
         
+        logic_str = filter_logic.upper()
         logger.info(
-            f"Filter applied: {len(merged_chunks)} -> {len(filtered_chunks)} chunks ({', '.join(filter_info)})"
+            f"Filter applied ({logic_str}): {len(merged_chunks)} -> {len(filtered_chunks)} chunks ({', '.join(filter_info)})"
         )
         merged_chunks = filtered_chunks
 
@@ -4374,8 +4387,11 @@ async def _get_node_data(
     if query_param.category:
         filters.append(f'category == "{query_param.category}"')
     
-    # Combine filters with AND logic
-    filter_expr = " and ".join(filters) if filters else None
+    # Combine filters with specified logic (AND or OR)
+    filter_expr = None
+    if filters:
+        logic_op = " or " if query_param.filter_logic.lower() == "or" else " and "
+        filter_expr = logic_op.join(filters)
     results = await entities_vdb.query(query, top_k=query_param.top_k, filter=filter_expr)
 
     if not len(results):
@@ -4655,8 +4671,11 @@ async def _get_edge_data(
     if query_param.category:
         filters.append(f'category == "{query_param.category}"')
     
-    # Combine filters with AND logic
-    filter_expr = " and ".join(filters) if filters else None
+    # Combine filters with specified logic (AND or OR)
+    filter_expr = None
+    if filters:
+        logic_op = " or " if query_param.filter_logic.lower() == "or" else " and "
+        filter_expr = logic_op.join(filters)
     results = await relationships_vdb.query(keywords, top_k=query_param.top_k, filter=filter_expr)
 
     if not len(results):
@@ -5015,9 +5034,10 @@ async def naive_query(
     if query_param.category:
         filters.append(f"category == '{query_param.category}'")
     
-    # Combine filters with AND logic
+    # Combine filters with specified logic (AND or OR)
     if filters:
-        filter_expression = " and ".join(filters)
+        logic_op = " or " if query_param.filter_logic.lower() == "or" else " and "
+        filter_expression = logic_op.join(filters)
 
     chunks = await _get_vector_context(
         query, chunks_vdb, query_param, None, filter=filter_expression

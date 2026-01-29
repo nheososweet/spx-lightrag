@@ -2649,6 +2649,7 @@ class LightRAG:
             enable_rerank=param.enable_rerank,
             table_name=param.table_name,
             category=param.category,
+            filter_logic=param.filter_logic,
         )
 
         query_result = None

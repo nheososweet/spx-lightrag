@@ -117,8 +117,23 @@ class QueryRequest(BaseModel):
 
     category: Optional[str] = Field(
         default=None,
-        description="Optional category filter for Milvus vector search. When provided, the vector search will only return chunks that have a matching category in their dynamic fields. This is a higher-level classification than table_name. When both table_name and category are provided, they are combined with AND logic.",
+        description="Optional category filter for Milvus vector search. When provided, the vector search will only return chunks that have a matching category in their dynamic fields. This is a higher-level classification than table_name. When both table_name and category are provided, they are combined with AND logic (or OR logic if filter_logic='or').",
     )
+
+    filter_logic: Optional[str] = Field(
+        default="and",
+        description="Logic operator for combining table_name and category filters. Options: 'and' (default) or 'or'. Only applies when both filters are provided.",
+    )
+
+    @field_validator("filter_logic", mode="after")
+    @classmethod
+    def validate_filter_logic(cls, filter_logic: str | None) -> str:
+        if filter_logic is None:
+            return "and"
+        filter_logic = filter_logic.lower().strip()
+        if filter_logic not in ["and", "or"]:
+            raise ValueError("filter_logic must be 'and' or 'or'")
+        return filter_logic
 
     @field_validator("query", mode="after")
     @classmethod
